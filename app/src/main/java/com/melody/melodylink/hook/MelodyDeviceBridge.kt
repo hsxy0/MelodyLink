@@ -5,13 +5,14 @@ import com.melody.melodylink.sony.config.SonyConfigRegistry
 import com.melody.melodylink.sony.config.SonyDeviceConfig
 import com.melody.melodylink.domain.DeviceIdentity as DomainDeviceIdentity
 import com.melody.melodylink.vendor.AdapterRegistry
+import com.melody.melodylink.vendor.samsung.SamsungVendorAdapter
 import com.melody.melodylink.vendor.sony.SonyVendorAdapter
 
 /** Holds configured device profiles outside the Xposed hook orchestration class. */
 internal class MelodyDeviceBridge {
     @Volatile
     private var registry: SonyConfigRegistry? = null
-    private val adapters = AdapterRegistry()
+    private val adapters = AdapterRegistry(listOf(SamsungVendorAdapter()))
 
     fun setRegistry(value: SonyConfigRegistry) {
         registry = value
@@ -27,4 +28,16 @@ internal class MelodyDeviceBridge {
 
     fun isRegisteredDevice(bluetoothName: String?): Boolean =
         bluetoothName != null && adapters.find(DomainDeviceIdentity(bluetoothName = bluetoothName)) != null
+
+    fun findSamsungDevice(
+        bluetoothName: String?,
+        address: String?,
+        serviceUuids: Set<String>,
+    ) = adapters.find(
+        DomainDeviceIdentity(
+            bluetoothName = bluetoothName,
+            address = address,
+            serviceUuids = serviceUuids,
+        ),
+    )
 }

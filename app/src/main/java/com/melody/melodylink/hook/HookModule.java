@@ -25,6 +25,8 @@ import com.melody.melodylink.domain.EarbudsState;
 import com.melody.melodylink.earbuds.EarbudsFacade;
 import com.melody.melodylink.vendor.sony.SonyDeviceCatalogAdapter;
 import com.melody.melodylink.vendor.sony.SonyEarbudsFacade;
+import com.melody.melodylink.vendor.samsung.SamsungEarbudsFacade;
+import com.melody.melodylink.samsung.config.SamsungGalaxyBudsCatalog;
 import com.melody.melodylink.sony.config.SonyConfigIssue;
 import com.melody.melodylink.sony.config.SonyConfigLoadResult;
 import com.melody.melodylink.sony.config.SonyConfigLoader;
@@ -63,6 +65,7 @@ public final class HookModule extends XposedModule {
     private volatile int targetAddressHash;
     private volatile String targetAddress;
     private volatile BluetoothDevice targetSonyDevice;
+    private volatile BluetoothDevice targetSamsungDevice;
     private volatile Object earphoneRepository;
     private volatile MelodySharedStateStore sharedStateStore;
     private final MelodySessionState sonySessionState = new MelodySessionState();
@@ -89,6 +92,44 @@ public final class HookModule extends XposedModule {
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ThreadLocal<Boolean> detailAncWriteObserved = new ThreadLocal<>();
     private final Map<SonyAdvancedSettingId, Object> advancedPreferences = new ConcurrentHashMap<>();
+    private final SamsungEarbudsFacade samsungTransport = new SamsungEarbudsFacade(new SamsungEarbudsFacade.Listener() {
+        @Override
+        public void onConnecting() {
+            log(Log.INFO, TAG, event("Samsung RFCOMM connecting"));
+        }
+
+        @Override
+        public void onConnected(EarbudsState state) {
+            log(Log.INFO, TAG, event("Samsung RFCOMM connected; ANC state=" + state.getAncMode()));
+        }
+
+        @Override
+        public void onBatteryState(EarbudsState state) {
+            log(Log.INFO, TAG, event("Samsung battery state received"));
+        }
+
+        @Override
+        public void onAncWriteResult(boolean success, EarbudsState state, String reason) {
+            log(success ? Log.INFO : Log.WARN, TAG, event("Samsung ANC write "
+                    + (success ? "succeeded" : "failed: " + reason)));
+        }
+
+        @Override
+        public void onDisconnected() {
+            log(Log.INFO, TAG, event("Samsung RFCOMM disconnected"));
+        }
+
+        @Override
+        public void onFailed(String reason) {
+            log(Log.WARN, TAG, event("Samsung RFCOMM failed: " + reason));
+        }
+
+        @Override
+        public void onLog(String message) {
+            log(Log.INFO, TAG, event(message));
+        }
+    });
+
     private final EarbudsFacade sonyTransport = new SonyEarbudsFacade(new EarbudsFacade.Listener() {
         @Override
         public void onConnecting() {
@@ -602,8 +643,16 @@ public final class HookModule extends XposedModule {
             Object device = deviceGetter.invoke(deviceInfo);
             if (!(address instanceof String) || !(device instanceof BluetoothDevice)
                     || !isTargetDevice((BluetoothDevice) device)) {
-                log(Log.WARN, TAG, event("Sony connection skipped: DeviceInfo has no registered Sony BluetoothDevice"));
+                log(Log.WARN, TAG, event("Sony connection skipped: DeviceInfo has no registered BluetoothDevice"));
                 return false;
+            }
+            if (isRegisteredSamsungDevice((BluetoothDevice) device)) {
+                targetSamsungDevice = (BluetoothDevice) device;
+                rememberTargetAddress((String) address);
+                log(Log.INFO, TAG, event("starting Samsung session name=" + ((BluetoothDevice) device).getName()
+                        + " addressHash=" + Integer.toHexString(((String) address).hashCode())));
+                samsungTransport.connect((BluetoothDevice) device);
+                return true;
             }
             String bluetoothAddress = ((BluetoothDevice) device).getAddress();
             if (!((String) address).equalsIgnoreCase(bluetoothAddress)) {
@@ -673,7 +722,11 @@ public final class HookModule extends XposedModule {
             int modeIndex = (Integer) value;
             com.melody.melodylink.domain.AncMode domainMode = MelodyCommandBridge.INSTANCE.ancMode(modeIndex);
             if (domainMode == null) return false;
-            sonyTransport.setAncMode(domainMode);
+            if (targetSamsungDevice != null && isRegisteredSamsungDevice(targetSamsungDevice)) {
+                samsungTransport.setAncMode(domainMode);
+            } else {
+                sonyTransport.setAncMode(domainMode);
+            }
             return true;
         } catch (Throwable t) {
             log(Log.WARN, TAG, "Sony noise reduction mapping failed", t);
@@ -1056,7 +1109,22 @@ public final class HookModule extends XposedModule {
     @SuppressLint("MissingPermission")
     private boolean isTargetDevice(BluetoothDevice device) {
         try {
-            return isRegisteredSonyName(device.getName());
+            return isRegisteredSonyName(device.getName()) || isRegisteredSamsungDevice(device);
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private boolean isRegisteredSamsungDevice(BluetoothDevice device) {
+        try {
+            java.util.Set<String> uuids = new java.util.HashSet<>();
+            if (device.getUuids() != null) {
+                for (android.os.ParcelUuid uuid : device.getUuids()) uuids.add(uuid.getUuid().toString());
+            }
+            return SamsungGalaxyBudsCatalog.INSTANCE.find(
+                    new com.melody.melodylink.domain.DeviceIdentity(device.getName(), device.getAddress(), uuids, null)
+            ) != null;
         } catch (Throwable ignored) {
             return false;
         }
@@ -1191,6 +1259,8 @@ public final class HookModule extends XposedModule {
         clearSharedSonySettingCommand();
         log(Log.INFO, TAG, event(reason + "; releasing Sony RFCOMM session"));
         sonyTransport.disconnect();
+        samsungTransport.disconnect();
+        targetSamsungDevice = null;
         refreshTargetRepository(reason);
     }
 

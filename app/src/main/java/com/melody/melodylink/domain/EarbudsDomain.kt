@@ -1,6 +1,6 @@
 package com.melody.melodylink.domain
 
-enum class Vendor { SONY, BOSE, HUAWEI, XIAOMI, UNKNOWN }
+enum class Vendor { SONY, SAMSUNG, BOSE, HUAWEI, XIAOMI, UNKNOWN }
 
 enum class AncMode { OFF, NOISE_CANCELING, AMBIENT_SOUND, TRANSPARENCY }
 
