@@ -1,0 +1,33 @@
+package com.op.bttest.huawei
+
+import com.melody.melodylink.domain.AncMode
+import com.melody.melodylink.domain.BatteryPart
+import com.melody.melodylink.huawei.config.HuaweiDeviceRoute
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class HuaweiProtocolTest {
+    @Test fun validatesCapturedAncStateFrame() {
+        val frame = framed(byteArrayOf(0x2B, 0x2A, 0x01, 0x02, 0x00, 0x02))
+        assertTrue(HuaweiFrameCodec.validFrames(frame).isNotEmpty())
+        assertEquals(AncMode.TRANSPARENCY, HuaweiStatusParser.parse(frame, HuaweiDeviceRoute.FREEBUDS7I)?.ancMode)
+    }
+
+    @Test fun parsesBatteryFrame() {
+        val payload = byteArrayOf(0x01, 0x08, 0x02, 0x03, 80, 70, 60, 0x03, 0x03, 1, 0, 1)
+        val frame = framed(payload)
+        val battery = HuaweiStatusParser.parse(frame, HuaweiDeviceRoute.FREEBUDS7I)?.battery.orEmpty()
+        assertEquals(80, battery[BatteryPart.LEFT]?.percent)
+        assertEquals(70, battery[BatteryPart.RIGHT]?.percent)
+        assertEquals(60, battery[BatteryPart.CASE]?.percent)
+    }
+
+    private fun framed(body: ByteArray): ByteArray {
+        val withoutCrc = byteArrayOf(0x5A, 0x00, (body.size + 1).toByte(), 0x00) + body
+        val crc = HuaweiFrameCodec.crc16Xmodem(withoutCrc)
+        return withoutCrc + byteArrayOf((crc shr 8).toByte(), crc.toByte())
+    }
+
+    private fun bytes(hex: String) = hex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+}

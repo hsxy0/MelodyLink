@@ -7,12 +7,13 @@ import com.melody.melodylink.domain.DeviceIdentity as DomainDeviceIdentity
 import com.melody.melodylink.vendor.AdapterRegistry
 import com.melody.melodylink.vendor.samsung.SamsungVendorAdapter
 import com.melody.melodylink.vendor.sony.SonyVendorAdapter
+import com.melody.melodylink.vendor.huawei.HuaweiVendorAdapter
 
 /** Holds configured device profiles outside the Xposed hook orchestration class. */
 internal class MelodyDeviceBridge {
     @Volatile
     private var registry: SonyConfigRegistry? = null
-    private val adapters = AdapterRegistry(listOf(SamsungVendorAdapter()))
+    private val adapters = AdapterRegistry(listOf(SamsungVendorAdapter(), HuaweiVendorAdapter()))
 
     fun setRegistry(value: SonyConfigRegistry) {
         registry = value

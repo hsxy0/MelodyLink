@@ -26,6 +26,8 @@ import com.melody.melodylink.earbuds.EarbudsFacade;
 import com.melody.melodylink.vendor.sony.SonyDeviceCatalogAdapter;
 import com.melody.melodylink.vendor.sony.SonyEarbudsFacade;
 import com.melody.melodylink.vendor.samsung.SamsungEarbudsFacade;
+import com.melody.melodylink.vendor.huawei.HuaweiEarbudsFacade;
+import com.melody.melodylink.huawei.config.HuaweiDeviceCatalog;
 import com.melody.melodylink.samsung.config.SamsungGalaxyBudsCatalog;
 import com.melody.melodylink.sony.config.SonyConfigIssue;
 import com.melody.melodylink.sony.config.SonyConfigLoadResult;
@@ -66,9 +68,11 @@ public final class HookModule extends XposedModule {
     private volatile String targetAddress;
     private volatile BluetoothDevice targetSonyDevice;
     private volatile BluetoothDevice targetSamsungDevice;
+    private volatile BluetoothDevice targetHuaweiDevice;
     private volatile Object earphoneRepository;
     private volatile MelodySharedStateStore sharedStateStore;
     private final MelodySessionState sonySessionState = new MelodySessionState();
+    private final MelodySessionState huaweiSessionState = new MelodySessionState();
     private volatile ClassLoader melodyClassLoader;
     private volatile CompletableFuture<Object> pendingNoiseWrite;
     private volatile AncMode pendingAncMode;
@@ -92,6 +96,53 @@ public final class HookModule extends XposedModule {
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ThreadLocal<Boolean> detailAncWriteObserved = new ThreadLocal<>();
     private final Map<SonyAdvancedSettingId, Object> advancedPreferences = new ConcurrentHashMap<>();
+    private final HuaweiEarbudsFacade huaweiTransport = new HuaweiEarbudsFacade(new HuaweiEarbudsFacade.Listener() {
+        @Override public void onConnecting() { log(Log.INFO, TAG, event("Huawei RFCOMM connecting")); }
+        @Override public void onConnected(EarbudsState state) {
+            huaweiSessionState.acceptAnc(state);
+            huaweiSessionState.acceptBattery(state);
+            writeSharedHuaweiState();
+            publishBatteryState(state, "Huawei connected");
+            refreshTargetRepository("Huawei connected");
+            log(Log.INFO, TAG, event("Huawei RFCOMM connected; ANC state=" + state.getAncMode()));
+        }
+        @Override public void onBatteryState(EarbudsState state) {
+            huaweiSessionState.acceptBattery(state);
+            writeSharedHuaweiState();
+            publishBatteryState(state, "Huawei battery read");
+            refreshTargetRepository("Huawei battery read");
+            log(Log.INFO, TAG, event("Huawei battery state received"));
+        }
+        @Override public void onAncWriteResult(boolean success, EarbudsState state, String reason) {
+            CompletableFuture<Object> future;
+            synchronized (HookModule.this) { future = pendingNoiseWrite; pendingNoiseWrite = null; }
+            log(success ? Log.INFO : Log.WARN, TAG, event("Huawei ANC write " + (success ? "succeeded" : "failed: " + reason)));
+            if (future == null) return;
+            if (success) {
+                if (state != null) {
+                    huaweiSessionState.acceptAnc(state);
+                    writeSharedHuaweiState();
+                    refreshTargetRepository("Huawei ANC write");
+                }
+                Object result = createSetCommandState(0);
+                if (result != null) future.complete(result); else future.completeExceptionally(new IllegalStateException("Huawei ANC result DTO unavailable"));
+            } else future.completeExceptionally(new IllegalStateException(reason));
+        }
+        @Override public void onDisconnected() {
+            failPendingNoiseWrite("Huawei transport disconnected");
+            clearHuaweiSessionState();
+            refreshTargetRepository("Huawei disconnected");
+            log(Log.INFO, TAG, event("Huawei RFCOMM disconnected"));
+        }
+        @Override public void onFailed(String reason) {
+            failPendingNoiseWrite(reason);
+            clearHuaweiSessionState();
+            refreshTargetRepository("Huawei failed");
+            log(Log.WARN, TAG, event("Huawei RFCOMM failed: " + reason));
+        }
+        @Override public void onLog(String message) { log(Log.INFO, TAG, event(message)); }
+    });
+
     private final SamsungEarbudsFacade samsungTransport = new SamsungEarbudsFacade(new SamsungEarbudsFacade.Listener() {
         @Override
         public void onConnecting() {
@@ -521,8 +572,9 @@ public final class HookModule extends XposedModule {
                     if ("noiseWrite".equals(label) && isTargetAddress(chain.getArg(1))) {
                         if (hasPendingNoiseWrite()) {
                             log(Log.INFO, TAG, event("ignored duplicate Sony noise update while ANC write is pending"));
-                        } else if (sonyTransport.isConnected() && startSonyNoiseWrite(chain.getArg(2))) {
-                            log(Log.INFO, TAG, event("routed target noise reduction write to Sony RFCOMM"));
+                        } else if ((sonyTransport.isConnected() || samsungTransport.isConnected() || huaweiTransport.isConnected())
+                                && startSonyNoiseWrite(chain.getArg(2))) {
+                            log(Log.INFO, TAG, event("routed target noise reduction write to vendor RFCOMM"));
                         } else {
                             log(Log.WARN, TAG, event("blocked target noise reduction write until Sony transport is ready"));
                         }
@@ -530,7 +582,8 @@ public final class HookModule extends XposedModule {
                     }
                     Object deviceName = arity > 2 ? chain.getArg(2) : null;
                     if ("whitelist".equals(label) && deviceName instanceof String
-                            && isRegisteredSonyName((String) deviceName)) {
+                            && (isRegisteredSonyName((String) deviceName)
+                            || isRegisteredHuaweiName((String) deviceName))) {
                         activeSonyImageProfile = findSonyProfileByName((String) deviceName);
                         Object profile = findProfile(chain.getArg(0), DeviceProfileMapper.SONY_TEST_PROFILE_ID, DeviceProfileMapper.SONY_TEST_PROFILE_NAME);
                         if (profile != null) {
@@ -646,6 +699,14 @@ public final class HookModule extends XposedModule {
                 log(Log.WARN, TAG, event("Sony connection skipped: DeviceInfo has no registered BluetoothDevice"));
                 return false;
             }
+            if (isRegisteredHuaweiDevice((BluetoothDevice) device)) {
+                targetHuaweiDevice = (BluetoothDevice) device;
+                rememberTargetAddress((String) address);
+                log(Log.INFO, TAG, event("starting Huawei session name=" + ((BluetoothDevice) device).getName()
+                        + " addressHash=" + Integer.toHexString(((String) address).hashCode())));
+                huaweiTransport.connect((BluetoothDevice) device);
+                return true;
+            }
             if (isRegisteredSamsungDevice((BluetoothDevice) device)) {
                 targetSamsungDevice = (BluetoothDevice) device;
                 rememberTargetAddress((String) address);
@@ -722,7 +783,9 @@ public final class HookModule extends XposedModule {
             int modeIndex = (Integer) value;
             com.melody.melodylink.domain.AncMode domainMode = MelodyCommandBridge.INSTANCE.ancMode(modeIndex);
             if (domainMode == null) return false;
-            if (targetSamsungDevice != null && isRegisteredSamsungDevice(targetSamsungDevice)) {
+            if (targetHuaweiDevice != null && isRegisteredHuaweiDevice(targetHuaweiDevice)) {
+                huaweiTransport.setAncMode(domainMode);
+            } else if (targetSamsungDevice != null && isRegisteredSamsungDevice(targetSamsungDevice)) {
                 samsungTransport.setAncMode(domainMode);
             } else {
                 sonyTransport.setAncMode(domainMode);
@@ -755,11 +818,15 @@ public final class HookModule extends XposedModule {
             pendingAncMode = domainMode;
             pendingBatteryRefresh = false;
         }
-        if (sonyTransport.isConnected()) {
+        if (targetHuaweiDevice != null && isRegisteredHuaweiDevice(targetHuaweiDevice)
+                && huaweiTransport.isConnected()) {
+            pendingAncMode = null;
+            huaweiTransport.setAncMode(domainMode);
+        } else if (sonyTransport.isConnected()) {
             runPendingSonyOperation();
         } else if (!connectTargetSonyTransport("ANC command")) {
             pendingAncMode = null;
-            failPendingNoiseWrite("Sony ANC command cannot start: target Bluetooth device is unavailable");
+            failPendingNoiseWrite("ANC command cannot start: target Bluetooth device is unavailable");
         }
         return future;
     }
@@ -1109,7 +1176,22 @@ public final class HookModule extends XposedModule {
     @SuppressLint("MissingPermission")
     private boolean isTargetDevice(BluetoothDevice device) {
         try {
-            return isRegisteredSonyName(device.getName()) || isRegisteredSamsungDevice(device);
+            return isRegisteredSonyName(device.getName()) || isRegisteredSamsungDevice(device) || isRegisteredHuaweiDevice(device);
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private boolean isRegisteredHuaweiDevice(BluetoothDevice device) {
+        try {
+            java.util.Set<String> uuids = new java.util.HashSet<>();
+            if (device.getUuids() != null) {
+                for (android.os.ParcelUuid uuid : device.getUuids()) uuids.add(uuid.getUuid().toString());
+            }
+            return HuaweiDeviceCatalog.INSTANCE.find(
+                    new com.melody.melodylink.domain.DeviceIdentity(device.getName(), device.getAddress(), uuids, null)
+            ) != null;
         } catch (Throwable ignored) {
             return false;
         }
@@ -1154,6 +1236,8 @@ public final class HookModule extends XposedModule {
 
     private boolean isSonyConnected() {
         return targetAddress != null && (sonyTransport.isConnected()
+                || samsungTransport.isConnected()
+                || huaweiTransport.isConnected()
                 || targetAddress.equalsIgnoreCase(readSharedSonyAddress()));
     }
 
@@ -1214,6 +1298,30 @@ public final class HookModule extends XposedModule {
         }
     }
 
+    private void writeSharedHuaweiState() {
+        if (!isPrimaryProcess() || targetAddress == null || targetHuaweiDevice == null) return;
+        File file = sharedStateFile();
+        if (file == null) return;
+        int mode = MelodyStateBridge.INSTANCE.ancModeIndex(huaweiSessionState.getAnc());
+        if (MelodySharedStateStore.writeState(file, targetAddress, android.os.Process.myPid(), mode, null, null)) {
+            log(Log.INFO, TAG, event("shared Huawei state published addressHash="
+                    + Integer.toHexString(targetAddress.hashCode()) + " mode=" + mode));
+        } else {
+            log(Log.WARN, TAG, "shared Huawei state write failed");
+        }
+    }
+
+    private void clearHuaweiSessionState() {
+        huaweiSessionState.clear();
+        if (!isPrimaryProcess() || targetHuaweiDevice == null) return;
+        File file = sharedStateFile();
+        MelodySharedStateStore.SharedState state = MelodySharedStateStore.readState(file);
+        if (state != null && targetAddress != null && targetAddress.equalsIgnoreCase(state.address)) {
+            clearSharedSonyState();
+        }
+        targetHuaweiDevice = null;
+    }
+
     /** Removes malformed or previous-process markers while retaining a live hook re-entry marker. */
     private void clearStaleSharedSonyState() {
         if (!isPrimaryProcess()) return;
@@ -1260,7 +1368,9 @@ public final class HookModule extends XposedModule {
         log(Log.INFO, TAG, event(reason + "; releasing Sony RFCOMM session"));
         sonyTransport.disconnect();
         samsungTransport.disconnect();
+        huaweiTransport.disconnect();
         targetSamsungDevice = null;
+        targetHuaweiDevice = null;
         refreshTargetRepository(reason);
     }
 
@@ -1316,6 +1426,13 @@ public final class HookModule extends XposedModule {
 
     private boolean isRegisteredSonyName(String bluetoothName) {
         return initializeSonyConfig() && deviceBridge.isRegisteredDevice(bluetoothName);
+    }
+
+    private boolean isRegisteredHuaweiName(String bluetoothName) {
+        return HuaweiDeviceCatalog.INSTANCE.find(
+                new com.melody.melodylink.domain.DeviceIdentity(bluetoothName, null,
+                        java.util.Collections.emptySet(), null)
+        ) != null;
     }
 
     private void clearSharedSonyCommand() {
@@ -2096,12 +2213,15 @@ public final class HookModule extends XposedModule {
     }
 
     private void publishSonyBatteryState(String reason) {
+        publishBatteryState(sonySessionState.getBattery(), reason);
+    }
+
+    private void publishBatteryState(EarbudsState state, String reason) {
         if (!isPrimaryProcess()) return;
-        EarbudsState state = sonySessionState.getBattery();
         Object repository = earphoneRepository;
         String address = targetAddress;
         if (state == null || repository == null || address == null) {
-            log(Log.WARN, TAG, event("Sony battery publish skipped: repository or state unavailable"));
+            log(Log.WARN, TAG, event("battery publish skipped: repository or state unavailable"));
             return;
         }
         try {
@@ -2122,9 +2242,9 @@ public final class HookModule extends XposedModule {
                     "com.oplus.melody.model.repository.earphone.V$a", false, loader);
             Constructor<?> constructor = batteryStatusClass.getConstructor(int.class, boolean.class);
             boolean updated = false;
-            updated |= setSonyBatteryStatus(status, "setLeftBatteryStatus", constructor, state.getBattery().get(BatteryPart.LEFT));
-            updated |= setSonyBatteryStatus(status, "setRightBatteryStatus", constructor, state.getBattery().get(BatteryPart.RIGHT));
-            updated |= setSonyBatteryStatus(status, "setBoxBatteryStatus", constructor, state.getBattery().get(BatteryPart.CASE));
+            updated |= setBatteryStatus(status, "setLeftBatteryStatus", constructor, state.getBattery().get(BatteryPart.LEFT));
+            updated |= setBatteryStatus(status, "setRightBatteryStatus", constructor, state.getBattery().get(BatteryPart.RIGHT));
+            updated |= setBatteryStatus(status, "setBoxBatteryStatus", constructor, state.getBattery().get(BatteryPart.CASE));
             if (!updated) {
                 log(Log.INFO, TAG, event("Sony battery publish retained previous Melody values (" + reason + ")"));
                 return;
@@ -2138,7 +2258,7 @@ public final class HookModule extends XposedModule {
         }
     }
 
-    private static boolean setSonyBatteryStatus(
+    private static boolean setBatteryStatus(
             Object status,
             String setterName,
             Constructor<?> constructor,
