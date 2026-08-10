@@ -15,5 +15,7 @@ data class HuaweiDeviceConfig(
     val supportsTransparency: Boolean,
     val supportsAncReadback: Boolean,
     val supportsAncLevels: Boolean,
+    /** Only enabled for models with a captured 0x2B/0x6C setter frame. */
+    val supportsLowLatency: Boolean,
     val batteryParts: Set<BatteryPart>,
 )

@@ -31,6 +31,7 @@ class HuaweiTransportAdapter(
         fun onConnected(state: EarbudsState)
         fun onBatteryState(state: EarbudsState)
         fun onAncWriteResult(success: Boolean, state: EarbudsState?, reason: String)
+        fun onLowLatencyWriteResult(success: Boolean, enabled: Boolean?, reason: String)
         fun onDisconnected()
         fun onFailed(reason: String)
         fun onLog(message: String)
@@ -102,6 +103,28 @@ class HuaweiTransportAdapter(
             } else if (!selected.supportsAncReadback && request == generation.get()) {
                 val state = (currentState ?: EarbudsState(selected.toProfileCapabilities())).copy(ancMode = mode)
                 pendingAnc = null; publish(state); listener.onAncWriteResult(true, state, "")
+            }
+        }
+    }
+
+    fun setLowLatency(enabled: Boolean) {
+        val selected = route
+        val active = transport
+        if (!isConnected || selected == null || active == null) {
+            listener.onLowLatencyWriteResult(false, null, "Huawei low-latency requested while disconnected")
+            return
+        }
+        val packet = HuaweiCommands.setLowLatency(selected, enabled)
+        if (packet == null) {
+            listener.onLowLatencyWriteResult(false, null, "Huawei low-latency is unsupported by ${selected.name}")
+            return
+        }
+        val request = generation.get()
+        scope.launch {
+            if (active.send(packet).isSuccess && request == generation.get()) {
+                listener.onLowLatencyWriteResult(true, enabled, "")
+            } else if (request == generation.get()) {
+                listener.onLowLatencyWriteResult(false, null, "Huawei low-latency command failed")
             }
         }
     }

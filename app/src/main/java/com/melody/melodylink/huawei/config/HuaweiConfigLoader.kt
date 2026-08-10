@@ -82,6 +82,7 @@ object HuaweiConfigLoader {
             supportsTransparency = capabilities.requiredBoolean("supportsTransparency"),
             supportsAncReadback = capabilities.requiredBoolean("supportsAncReadback"),
             supportsAncLevels = capabilities.requiredBoolean("supportsAncLevels"),
+            supportsLowLatency = capabilities.requiredBoolean("supportsLowLatency"),
             batteryParts = json.requiredStringList("batteryParts").map(BatteryPart::valueOf).toSet(),
         )
     }

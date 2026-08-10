@@ -66,6 +66,7 @@ public final class HookModule extends XposedModule {
     private static final String TARGET = "com.oplus.melody";
     private static final String ADVANCED_CATEGORY_KEY = "melodylink.advanced_settings";
     private static final String ADVANCED_SETTING_KEY_PREFIX = "melodylink.setting.";
+    private static final String HUAWEI_LOW_LATENCY_SETTING_KEY = "melodylink.huawei.low_latency";
     private static final String SOUND_QUALITY_TITLE = "音质音效";
     private static final int WF_1000XM3_PRODUCT_ID = 0x067410;
     private volatile int targetAddressHash;
@@ -101,11 +102,14 @@ public final class HookModule extends XposedModule {
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ThreadLocal<Boolean> detailAncWriteObserved = new ThreadLocal<>();
     private final Map<SonyAdvancedSettingId, Object> advancedPreferences = new ConcurrentHashMap<>();
+    private volatile Object huaweiLowLatencyPreference;
+    private volatile Boolean confirmedHuaweiLowLatency;
     private final HuaweiEarbudsFacade huaweiTransport = new HuaweiEarbudsFacade(new HuaweiEarbudsFacade.Listener() {
         @Override public void onConnecting() { log(Log.INFO, TAG, event("Huawei RFCOMM connecting")); }
         @Override public void onConnected(EarbudsState state) {
             huaweiSessionState.acceptAnc(state);
             huaweiSessionState.acceptBattery(state);
+            updateHuaweiLowLatencyPreference(null, true);
             writeSharedHuaweiState();
             publishBatteryState(state, "Huawei connected");
             refreshTargetRepository("Huawei connected");
@@ -132,6 +136,15 @@ public final class HookModule extends XposedModule {
                 Object result = createSetCommandState(0);
                 if (result != null) future.complete(result); else future.completeExceptionally(new IllegalStateException("Huawei ANC result DTO unavailable"));
             } else future.completeExceptionally(new IllegalStateException(reason));
+        }
+        @Override public void onLowLatencyWriteResult(boolean success, Boolean enabled, String reason) {
+            if (success && enabled != null) {
+                confirmedHuaweiLowLatency = enabled;
+                updateHuaweiLowLatencyPreference(enabled, true);
+            } else {
+                updateHuaweiLowLatencyPreference(null, true);
+                log(Log.WARN, TAG, event("Huawei low-latency write failed: " + reason));
+            }
         }
         @Override public void onDisconnected() {
             failPendingNoiseWrite("Huawei transport disconnected");
@@ -1673,8 +1686,11 @@ public final class HookModule extends XposedModule {
     }
 
     private void installAdvancedSettings(Object anchor) {
-        if (!isAdvancedSettingsAnchor(anchor) || activeSonyImageProfile == null
-                || activeSonyImageProfile.getAdvancedSettings().isEmpty()) return;
+        boolean hasSonySettings = activeSonyImageProfile != null
+                && !activeSonyImageProfile.getAdvancedSettings().isEmpty();
+        boolean hasHuaweiLowLatency = activeHuaweiImageProfile != null
+                && activeHuaweiImageProfile.getSupportsLowLatency();
+        if (!isAdvancedSettingsAnchor(anchor) || (!hasSonySettings && !hasHuaweiLowLatency)) return;
         try {
             Object soundGroup = invokeNoArg(anchor, "getParent");
             if (soundGroup == null) return;
@@ -1701,6 +1717,12 @@ public final class HookModule extends XposedModule {
                 return;
             }
             advancedPreferences.clear();
+            huaweiLowLatencyPreference = null;
+            if (hasHuaweiLowLatency) {
+                addHuaweiLowLatencyPreference(category, loader, activity, 10);
+                log(Log.INFO, TAG, event("installed Huawei low-latency setting"));
+                return;
+            }
             if (isPrimaryProcess() && !sonyTransport.isConnected()) {
                 connectTargetSonyTransport("advanced settings read");
             }
@@ -1735,8 +1757,7 @@ public final class HookModule extends XposedModule {
     }
 
     private void schedulePreferenceFragmentBinding(Object hostFragment) {
-        if (hostFragment == null || activeSonyImageProfile == null
-                || activeSonyImageProfile.getAdvancedSettings().isEmpty()) return;
+        if (hostFragment == null) return;
         Object activityValue = invokeNoArg(hostFragment, "getActivity");
         if (!(activityValue instanceof Activity)) {
             log(Log.WARN, TAG, event("advanced settings host activity unavailable"));
@@ -1775,8 +1796,7 @@ public final class HookModule extends XposedModule {
     }
 
     private void scheduleDirectPreferenceFragmentBinding(Object fragment) {
-        if (fragment == null || activeSonyImageProfile == null
-                || activeSonyImageProfile.getAdvancedSettings().isEmpty()) return;
+        if (fragment == null) return;
         Object activityValue = invokeNoArg(fragment, "getActivity");
         if (!(activityValue instanceof Activity)) return;
         Activity activity = (Activity) activityValue;
@@ -1808,6 +1828,11 @@ public final class HookModule extends XposedModule {
     }
 
     private void installAdvancedSettingsFromPreferenceFragment(Activity activity, Object fragment) {
+        boolean hasSonySettings = activeSonyImageProfile != null
+                && !activeSonyImageProfile.getAdvancedSettings().isEmpty();
+        boolean hasHuaweiLowLatency = activeHuaweiImageProfile != null
+                && activeHuaweiImageProfile.getSupportsLowLatency();
+        if (!hasSonySettings && !hasHuaweiLowLatency) return;
         try {
             ClassLoader loader = fragment.getClass().getClassLoader();
             Class<?> managerType = Class.forName("androidx.preference.g", false, loader);
@@ -1846,6 +1871,12 @@ public final class HookModule extends XposedModule {
             if (order != null) setPreferenceValue(category, "setOrder", order + 1);
             if (!addPreference(parent, category, loader)) throw new IllegalStateException("category add rejected");
             advancedPreferences.clear();
+            huaweiLowLatencyPreference = null;
+            if (hasHuaweiLowLatency) {
+                addHuaweiLowLatencyPreference(category, loader, activity, 10);
+                log(Log.INFO, TAG, event("installed Huawei low-latency setting via preference fragment"));
+                return;
+            }
             for (com.melody.melodylink.sony.config.SonyAdvancedSettingConfig setting
                     : activeSonyImageProfile.getAdvancedSettings()) {
                 Object item = newSwitchPreference(loader, activity);
@@ -2000,6 +2031,74 @@ public final class HookModule extends XposedModule {
         Object preference = advancedPreferences.get(id);
         if (preference == null) return;
         mainHandler.post(() -> setPreferenceValue(preference, "setEnabled", enabled));
+    }
+
+    private void addHuaweiLowLatencyPreference(Object category, ClassLoader loader, Activity activity, int order) {
+        Object item = newSwitchPreference(loader, activity);
+        if (item == null) {
+            log(Log.WARN, TAG, event("Huawei low-latency switch constructor unavailable"));
+            return;
+        }
+        setPreferenceValue(item, "setKey", HUAWEI_LOW_LATENCY_SETTING_KEY);
+        setPreferenceValue(item, "setOrder", order);
+        setPreferenceValue(item, "setTitle", "低时延模式");
+        setPreferenceValue(item, "setSummary", "降低游戏和视频的音频延迟");
+        setPreferenceValue(item, "setPersistent", false);
+        setPreferenceValue(item, "setChecked", confirmedHuaweiLowLatency != null && confirmedHuaweiLowLatency);
+        setPreferenceValue(item, "setEnabled", huaweiTransport.isConnected());
+        installHuaweiLowLatencyListener(item, loader);
+        if (addPreference(category, item, loader)) huaweiLowLatencyPreference = item;
+    }
+
+    private void updateHuaweiLowLatencyPreference(Boolean value, boolean enabled) {
+        Object preference = huaweiLowLatencyPreference;
+        if (preference == null) return;
+        mainHandler.post(() -> {
+            if (value != null) setPreferenceValue(preference, "setChecked", value);
+            setPreferenceValue(preference, "setEnabled", enabled);
+        });
+    }
+
+    private void installHuaweiLowLatencyListener(Object preference, ClassLoader loader) {
+        Method listenerSetter = null;
+        for (Method candidate : allMethods(preference.getClass())) {
+            if (candidate.getName().equals("setOnPreferenceChangeListener")
+                    && candidate.getParameterTypes().length == 1) {
+                listenerSetter = candidate;
+                break;
+            }
+        }
+        if (listenerSetter == null || !listenerSetter.getParameterTypes()[0].isInterface()) return;
+        Class<?> listenerType = listenerSetter.getParameterTypes()[0];
+        Method callback = null;
+        for (Method candidate : listenerType.getMethods()) {
+            if (candidate.getReturnType() == Boolean.TYPE && candidate.getParameterTypes().length == 2) {
+                callback = candidate;
+                break;
+            }
+        }
+        final Method changeCallback = callback;
+        Object listener = Proxy.newProxyInstance(loader, new Class<?>[]{listenerType}, (proxy, method, args) -> {
+            if ("toString".equals(method.getName())) return "MelodyLinkHuaweiLowLatencyListener";
+            if ("hashCode".equals(method.getName())) return System.identityHashCode(proxy);
+            if ("equals".equals(method.getName())) return proxy == (args == null ? null : args[0]);
+            if (changeCallback == null || !method.getName().equals(changeCallback.getName())
+                    || args == null || args.length < 2 || !(args[1] instanceof Boolean)) return null;
+            if (!isPrimaryProcess() || !huaweiTransport.isConnected()) {
+                log(Log.WARN, TAG, event("Huawei low-latency write skipped: RFCOMM session unavailable"));
+                updateHuaweiLowLatencyPreference(null, huaweiTransport.isConnected());
+                return false;
+            }
+            setPreferenceValue(preference, "setEnabled", false);
+            huaweiTransport.setLowLatency((Boolean) args[1]);
+            return true;
+        });
+        try {
+            listenerSetter.setAccessible(true);
+            listenerSetter.invoke(preference, listener);
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "Huawei low-latency listener attach failed", t);
+        }
     }
 
     private void installSettingListener(Object preference, SonyAdvancedSettingId id, ClassLoader loader) {

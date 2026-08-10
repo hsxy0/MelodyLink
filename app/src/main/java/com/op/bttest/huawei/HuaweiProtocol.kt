@@ -17,6 +17,9 @@ object HuaweiCommands {
     private val modernOff = packet(0x5A, 0x00, 0x07, 0x00, 0x2B, 0x04, 0x01, 0x02, 0x00, 0x00, 0xD2, 0x2D)
     private val modernAnc = packet(0x5A, 0x00, 0x07, 0x00, 0x2B, 0x04, 0x01, 0x02, 0x01, 0xFF, 0xFF, 0xEC)
     private val transparency = packet(0x5A, 0x00, 0x07, 0x00, 0x2B, 0x04, 0x01, 0x02, 0x02, 0xFF, 0xAA, 0xBF)
+    // Verified HuaweiPods captures. The device does not expose a readable low-latency state.
+    private val lowLatencyDisabled = packet(0x5A, 0x00, 0x06, 0x00, 0x2B, 0x6C, 0x01, 0x01, 0x00, 0xB4, 0x30)
+    private val lowLatencyEnabled = packet(0x5A, 0x00, 0x06, 0x00, 0x2B, 0x6C, 0x01, 0x01, 0x01, 0xA4, 0x11)
 
     fun batteryQuery(route: HuaweiDeviceConfig): ByteArray? = batteryQuery.takeIf { route.batteryParts.isNotEmpty() }?.copyOf()
     fun stateQuery(route: HuaweiDeviceConfig): ByteArray? = currentStateQuery.takeIf { route.supportsAncReadback }?.copyOf()
@@ -25,6 +28,11 @@ object HuaweiCommands {
         AncMode.NOISE_CANCELING -> modernAnc
         AncMode.AMBIENT_SOUND, AncMode.TRANSPARENCY -> transparency.takeIf { route.supportsTransparency }
     }?.takeIf { route.supportsAnc }?.copyOf()
+
+    fun setLowLatency(route: HuaweiDeviceConfig, enabled: Boolean): ByteArray? =
+        (if (enabled) lowLatencyEnabled else lowLatencyDisabled)
+            .takeIf { route.supportsLowLatency }
+            ?.copyOf()
 
     private fun packet(vararg values: Int): ByteArray = values.map(Int::toByte).toByteArray()
 }
