@@ -6,7 +6,7 @@ import com.melody.melodylink.domain.AncMode
 import com.melody.melodylink.domain.EarbudsCapabilities
 import com.melody.melodylink.domain.EarbudsState
 import com.melody.melodylink.huawei.config.HuaweiDeviceCatalog
-import com.melody.melodylink.huawei.config.HuaweiDeviceRoute
+import com.melody.melodylink.huawei.config.HuaweiDeviceConfig
 import com.melody.melodylink.transport.EarbudsTransport
 import com.melody.melodylink.transport.RfcommTransport
 import com.melody.melodylink.transport.TransportEndpoint
@@ -40,7 +40,7 @@ class HuaweiTransportAdapter(
     private val generation = AtomicLong()
     private var job: Job? = null
     private var transport: EarbudsTransport? = null
-    private var route: HuaweiDeviceRoute? = null
+    private var route: HuaweiDeviceConfig? = null
     private var currentState: EarbudsState? = null
     private var pendingAnc: AncMode? = null
 
@@ -93,7 +93,7 @@ class HuaweiTransportAdapter(
         val selected = route
         val active = transport
         if (!isConnected || selected == null || active == null) { listener.onAncWriteResult(false, null, "Huawei ANC requested while disconnected"); return }
-        if (mode !in selected.toProfileCapabilities().ancModes) { listener.onAncWriteResult(false, null, "Huawei ANC mode unsupported by ${selected.displayName}"); return }
+        if (mode !in selected.toProfileCapabilities().ancModes) { listener.onAncWriteResult(false, null, "Huawei ANC mode unsupported by ${selected.name}"); return }
         val request = generation.get(); pendingAnc = mode
         scope.launch {
             val packet = HuaweiCommands.setAnc(selected, mode)
@@ -129,13 +129,13 @@ class HuaweiTransportAdapter(
         if (expected != null && state.ancMode == expected) { pendingAnc = null; listener.onAncWriteResult(true, state, "") }
     }
 
-    private fun com.op.bttest.huawei.HuaweiParsedState.toState(route: HuaweiDeviceRoute) = EarbudsState(
+    private fun com.op.bttest.huawei.HuaweiParsedState.toState(route: HuaweiDeviceConfig) = EarbudsState(
         capabilities = route.toProfileCapabilities(),
         ancMode = ancMode ?: currentState?.ancMode,
         battery = if (battery.isEmpty()) currentState?.battery.orEmpty() else battery,
     )
 
-    private fun HuaweiDeviceRoute.toProfileCapabilities() = EarbudsCapabilities(
+    private fun HuaweiDeviceConfig.toProfileCapabilities() = EarbudsCapabilities(
         ancModes = buildSet { add(AncMode.OFF); if (supportsAnc) add(AncMode.NOISE_CANCELING); if (supportsTransparency) add(AncMode.TRANSPARENCY) },
         batteryParts = batteryParts,
     )

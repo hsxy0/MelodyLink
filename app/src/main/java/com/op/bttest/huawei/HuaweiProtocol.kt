@@ -3,7 +3,7 @@ package com.op.bttest.huawei
 import com.melody.melodylink.domain.AncMode
 import com.melody.melodylink.domain.BatteryPart
 import com.melody.melodylink.domain.BatteryValue
-import com.melody.melodylink.huawei.config.HuaweiDeviceRoute
+import com.melody.melodylink.huawei.config.HuaweiDeviceConfig
 
 /** Independent Kotlin implementation of the verified Huawei 0x5A/0x2B RFCOMM framing. */
 data class HuaweiParsedState(
@@ -18,9 +18,9 @@ object HuaweiCommands {
     private val modernAnc = packet(0x5A, 0x00, 0x07, 0x00, 0x2B, 0x04, 0x01, 0x02, 0x01, 0xFF, 0xFF, 0xEC)
     private val transparency = packet(0x5A, 0x00, 0x07, 0x00, 0x2B, 0x04, 0x01, 0x02, 0x02, 0xFF, 0xAA, 0xBF)
 
-    fun batteryQuery(route: HuaweiDeviceRoute): ByteArray? = batteryQuery.takeIf { route.batteryParts.isNotEmpty() }?.copyOf()
-    fun stateQuery(route: HuaweiDeviceRoute): ByteArray? = currentStateQuery.takeIf { route.supportsAncReadback }?.copyOf()
-    fun setAnc(route: HuaweiDeviceRoute, mode: AncMode): ByteArray? = when (mode) {
+    fun batteryQuery(route: HuaweiDeviceConfig): ByteArray? = batteryQuery.takeIf { route.batteryParts.isNotEmpty() }?.copyOf()
+    fun stateQuery(route: HuaweiDeviceConfig): ByteArray? = currentStateQuery.takeIf { route.supportsAncReadback }?.copyOf()
+    fun setAnc(route: HuaweiDeviceConfig, mode: AncMode): ByteArray? = when (mode) {
         AncMode.OFF -> modernOff
         AncMode.NOISE_CANCELING -> modernAnc
         AncMode.AMBIENT_SOUND, AncMode.TRANSPARENCY -> transparency.takeIf { route.supportsTransparency }
@@ -62,7 +62,7 @@ object HuaweiFrameCodec {
 }
 
 object HuaweiStatusParser {
-    fun parse(stream: ByteArray, route: HuaweiDeviceRoute): HuaweiParsedState? {
+    fun parse(stream: ByteArray, route: HuaweiDeviceConfig): HuaweiParsedState? {
         var state: HuaweiParsedState? = null
         HuaweiFrameCodec.validFrames(stream).forEach { frame ->
             val service = frame.getOrNull(4)?.u8() ?: return@forEach

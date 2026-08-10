@@ -2,22 +2,26 @@ package com.op.bttest.huawei
 
 import com.melody.melodylink.domain.AncMode
 import com.melody.melodylink.domain.BatteryPart
-import com.melody.melodylink.huawei.config.HuaweiDeviceRoute
+import com.melody.melodylink.huawei.config.HuaweiConfigLoader
+import java.io.File
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class HuaweiProtocolTest {
+    private val route = HuaweiConfigLoader.fromDirectory(mainAssetsDirectory()).registry.profiles
+        .first { it.id == "huawei.freebuds7i" }
+
     @Test fun validatesCapturedAncStateFrame() {
         val frame = framed(byteArrayOf(0x2B, 0x2A, 0x01, 0x02, 0x00, 0x02))
         assertTrue(HuaweiFrameCodec.validFrames(frame).isNotEmpty())
-        assertEquals(AncMode.TRANSPARENCY, HuaweiStatusParser.parse(frame, HuaweiDeviceRoute.FREEBUDS7I)?.ancMode)
+        assertEquals(AncMode.TRANSPARENCY, HuaweiStatusParser.parse(frame, route)?.ancMode)
     }
 
     @Test fun parsesBatteryFrame() {
         val payload = byteArrayOf(0x01, 0x08, 0x02, 0x03, 80, 70, 60, 0x03, 0x03, 1, 0, 1)
         val frame = framed(payload)
-        val battery = HuaweiStatusParser.parse(frame, HuaweiDeviceRoute.FREEBUDS7I)?.battery.orEmpty()
+        val battery = HuaweiStatusParser.parse(frame, route)?.battery.orEmpty()
         assertEquals(80, battery[BatteryPart.LEFT]?.percent)
         assertEquals(70, battery[BatteryPart.RIGHT]?.percent)
         assertEquals(60, battery[BatteryPart.CASE]?.percent)
@@ -31,3 +35,9 @@ class HuaweiProtocolTest {
 
     private fun bytes(hex: String) = hex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
 }
+
+private fun mainAssetsDirectory(): File = sequenceOf(
+    File("src/main/assets"),
+    File("app/src/main/assets"),
+    File("../app/src/main/assets"),
+).firstOrNull(File::isDirectory) ?: error("main assets directory was not found")

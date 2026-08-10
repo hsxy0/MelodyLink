@@ -28,6 +28,10 @@ import com.melody.melodylink.vendor.sony.SonyEarbudsFacade;
 import com.melody.melodylink.vendor.samsung.SamsungEarbudsFacade;
 import com.melody.melodylink.vendor.huawei.HuaweiEarbudsFacade;
 import com.melody.melodylink.huawei.config.HuaweiDeviceCatalog;
+import com.melody.melodylink.huawei.config.HuaweiConfigIssue;
+import com.melody.melodylink.huawei.config.HuaweiConfigLoadResult;
+import com.melody.melodylink.huawei.config.HuaweiConfigLoader;
+import com.melody.melodylink.huawei.config.HuaweiDeviceConfig;
 import com.melody.melodylink.samsung.config.SamsungGalaxyBudsCatalog;
 import com.melody.melodylink.sony.config.SonyConfigIssue;
 import com.melody.melodylink.sony.config.SonyConfigLoadResult;
@@ -88,6 +92,7 @@ public final class HookModule extends XposedModule {
     private final MelodyDeviceBridge deviceBridge = new MelodyDeviceBridge();
     private volatile AssetManager sonyModuleAssets;
     private volatile SonyDeviceConfig activeSonyImageProfile;
+    private volatile HuaweiDeviceConfig activeHuaweiImageProfile;
     private volatile boolean retainSharedSonyStateAfterCommandDisconnect;
     private volatile boolean activityLifecycleRegistered;
     private volatile Activity detailActivity;
@@ -424,16 +429,16 @@ public final class HookModule extends XposedModule {
                 }
                 try {
                     captureRepository(label, chain);
-                    if ("sonyCardImage".equals(label) && replaceSonyProductImage(
+                    if ("sonyCardImage".equals(label) && replaceConfiguredProductImage(
                             chain.getThisObject(), "b", "c", "d", "e", "d", "card")) {
                         return null;
                     }
-                    if ("sonyDetailImage".equals(label) && replaceSonyProductImage(
+                    if ("sonyDetailImage".equals(label) && replaceConfiguredProductImage(
                             chain.getThisObject(), "g", "b", "c", "d", "e", "detail",
                             findDetailImageView(chain.getThisObject()))) {
                         return null;
                     }
-                    if ("sonyDetailPlaceholder".equals(label) && replaceSonyProductImage(
+                    if ("sonyDetailPlaceholder".equals(label) && replaceConfiguredProductImage(
                             chain.getThisObject(), "g", "b", "c", "d", "e", "detail",
                             findDetailImageView(chain.getThisObject()))) {
                         return null;
@@ -445,7 +450,7 @@ public final class HookModule extends XposedModule {
                     }
                     if ("sonyCardBind".equals(label)) {
                         Object result = chain.proceed();
-                        replaceSonyProductImage(chain.getThisObject(), "b", "c", "d", "e", "d",
+                        replaceConfiguredProductImage(chain.getThisObject(), "b", "c", "d", "e", "d",
                                 "card", findCardImageView(chain.getArg(0)));
                         return result;
                     }
@@ -585,6 +590,7 @@ public final class HookModule extends XposedModule {
                             && (isRegisteredSonyName((String) deviceName)
                             || isRegisteredHuaweiName((String) deviceName))) {
                         activeSonyImageProfile = findSonyProfileByName((String) deviceName);
+                        activeHuaweiImageProfile = findHuaweiProfileByName((String) deviceName);
                         Object profile = findProfile(chain.getArg(0), DeviceProfileMapper.SONY_TEST_PROFILE_ID, DeviceProfileMapper.SONY_TEST_PROFILE_NAME);
                         if (profile != null) {
                             log(Log.WARN, TAG, event("mapping registered Sony device " + deviceName
@@ -912,21 +918,57 @@ public final class HookModule extends XposedModule {
                 return false;
             }
             SonyConfigLoadResult result = SonyConfigLoader.INSTANCE.fromAssets(moduleAssets);
+            HuaweiConfigLoadResult huaweiResult = HuaweiConfigLoader.INSTANCE.fromAssets(moduleAssets);
             sonyTransport.setCatalog(new SonyDeviceCatalogAdapter(result.getRegistry()));
             deviceBridge.setRegistry(result.getRegistry());
+            HuaweiDeviceCatalog.INSTANCE.setRegistry(huaweiResult.getRegistry());
             sonyModuleAssets = moduleAssets;
             for (SonyConfigIssue issue : result.getIssues()) {
                 log(Log.WARN, TAG, event("Sony configuration skipped " + issue.getPath()
                         + ": " + issue.getMessage()));
             }
+            for (HuaweiConfigIssue issue : huaweiResult.getIssues()) {
+                log(Log.WARN, TAG, event("Huawei configuration skipped " + issue.getPath()
+                        + ": " + issue.getMessage()));
+            }
             sonyConfigInitialized = true;
             log(Log.INFO, TAG, event("loaded " + result.getRegistry().getProfiles().size()
-                    + " Sony device profiles from " + moduleApkPath));
+                    + " Sony and " + huaweiResult.getRegistry().getProfiles().size()
+                    + " Huawei device profiles from " + moduleApkPath));
             return true;
         } catch (Throwable t) {
             log(Log.ERROR, TAG, "Sony configuration initialization failed", t);
             return false;
         }
+    }
+
+    private boolean replaceConfiguredProductImage(
+            Object owner,
+            String viewModelField,
+            String addressField,
+            String nameField,
+            String imageField,
+            String loadingField,
+            String surface
+    ) {
+        return replaceConfiguredProductImage(owner, viewModelField, addressField, nameField,
+                imageField, loadingField, surface, null);
+    }
+
+    private boolean replaceConfiguredProductImage(
+            Object owner,
+            String viewModelField,
+            String addressField,
+            String nameField,
+            String imageField,
+            String loadingField,
+            String surface,
+            ImageView fallbackImageView
+    ) {
+        return replaceSonyProductImage(owner, viewModelField, addressField, nameField,
+                imageField, loadingField, surface, fallbackImageView)
+                || replaceHuaweiProductImage(owner, viewModelField, addressField, nameField,
+                imageField, loadingField, surface, fallbackImageView);
     }
 
     /** Replaces only the two product-image views identified from Melody 16.8.3's resource flow. */
@@ -1016,7 +1058,7 @@ public final class HookModule extends XposedModule {
     private void replaceSonyDetailImageLater(Object owner) {
         if (!(owner instanceof View)) return;
         View view = (View) owner;
-        view.post(() -> replaceSonyProductImage(owner, "g", "b", "c", "d", "e", "detail",
+        view.post(() -> replaceConfiguredProductImage(owner, "g", "b", "c", "d", "e", "detail",
                 findDetailImageView(owner)));
     }
 
@@ -1059,6 +1101,84 @@ public final class HookModule extends XposedModule {
             return output.isFile() && output.length() > 0L ? output : null;
         } catch (Throwable t) {
             log(Log.WARN, TAG, "Sony image materialization failed", t);
+            return null;
+        }
+    }
+
+    private boolean replaceHuaweiProductImage(
+            Object owner,
+            String viewModelField,
+            String addressField,
+            String nameField,
+            String imageField,
+            String loadingField,
+            String surface,
+            ImageView fallbackImageView
+    ) {
+        Object viewModel = readField(owner, viewModelField);
+        String address = asString(readField(viewModel, addressField));
+        String name = asString(readField(viewModel, nameField));
+        HuaweiDeviceConfig profile = findHuaweiImageProfile(address, name);
+        if (profile == null) return false;
+
+        Object imageValue = readField(owner, imageField);
+        ImageView imageView = imageValue instanceof ImageView
+                ? (ImageView) imageValue : fallbackImageView;
+        if (imageView == null) {
+            log(Log.WARN, TAG, event("Huawei " + surface + " image target unavailable"));
+            return false;
+        }
+        File imageFile = materializeHuaweiImage(profile);
+        if (imageFile == null) {
+            log(Log.WARN, TAG, event("Huawei " + surface + " image skipped: asset unavailable profile="
+                    + profile.getId()));
+            return false;
+        }
+
+        imageView.setImageURI(Uri.fromFile(imageFile));
+        imageView.setVisibility(View.VISIBLE);
+        hideLoadingView(readField(owner, loadingField));
+        log(Log.INFO, TAG, event("replaced Huawei " + surface + " product image profile="
+                + profile.getId()));
+        return true;
+    }
+
+    private HuaweiDeviceConfig findHuaweiImageProfile(String address, String name) {
+        HuaweiDeviceConfig profile = findHuaweiProfileByName(name);
+        if (profile == null) profile = activeHuaweiImageProfile;
+        if (profile == null || profile.getImage().trim().isEmpty()) return null;
+        if (address != null && isTargetAddress(address)) rememberTargetAddress(address);
+        return profile;
+    }
+
+    private HuaweiDeviceConfig findHuaweiProfileByName(String name) {
+        com.melody.melodylink.huawei.config.HuaweiDeviceMatch match = HuaweiDeviceCatalog.INSTANCE.find(
+                new com.melody.melodylink.domain.DeviceIdentity(name, null,
+                        java.util.Collections.emptySet(), null)
+        );
+        return match != null ? match.getRoute() : null;
+    }
+
+    private File materializeHuaweiImage(HuaweiDeviceConfig profile) {
+        Application application = currentApplication();
+        AssetManager assets = sonyModuleAssets;
+        String assetPath = profile.getImage();
+        if (application == null || assets == null || !assetPath.startsWith("huawei/images/")) return null;
+        String fileName = new File(assetPath).getName();
+        File directory = new File(application.getFilesDir(), "melodylink/huawei-images");
+        File output = new File(directory, profile.getId().replace('.', '_') + "-" + fileName);
+        try {
+            if (output.isFile() && output.length() > 0L) return output;
+            if (!directory.isDirectory() && !directory.mkdirs()) return null;
+            try (java.io.InputStream input = assets.open(assetPath);
+                 FileOutputStream stream = new FileOutputStream(output, false)) {
+                byte[] buffer = new byte[8192];
+                int count;
+                while ((count = input.read(buffer)) != -1) stream.write(buffer, 0, count);
+            }
+            return output.isFile() && output.length() > 0L ? output : null;
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "Huawei image materialization failed", t);
             return null;
         }
     }
@@ -1429,6 +1549,7 @@ public final class HookModule extends XposedModule {
     }
 
     private boolean isRegisteredHuaweiName(String bluetoothName) {
+        if (!initializeSonyConfig()) return false;
         return HuaweiDeviceCatalog.INSTANCE.find(
                 new com.melody.melodylink.domain.DeviceIdentity(bluetoothName, null,
                         java.util.Collections.emptySet(), null)

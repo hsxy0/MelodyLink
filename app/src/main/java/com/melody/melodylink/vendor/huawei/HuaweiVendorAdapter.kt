@@ -6,7 +6,7 @@ import com.melody.melodylink.domain.DeviceProfile
 import com.melody.melodylink.domain.EarbudsCapabilities
 import com.melody.melodylink.domain.Vendor
 import com.melody.melodylink.huawei.config.HuaweiDeviceCatalog
-import com.melody.melodylink.huawei.config.HuaweiDeviceRoute
+import com.melody.melodylink.huawei.config.HuaweiDeviceConfig
 import com.melody.melodylink.vendor.VendorAdapter
 
 class HuaweiVendorAdapter : VendorAdapter {
@@ -21,10 +21,10 @@ object HuaweiDeviceCatalogAdapter {
     fun findBest(identity: DeviceIdentity): DeviceProfile? = HuaweiDeviceCatalog.find(identity)?.route?.toProfile()
     fun profile(id: String): DeviceProfile? = HuaweiDeviceCatalog.models.firstOrNull { it.id == id }?.toProfile()
 
-    private fun HuaweiDeviceRoute.toProfile() = DeviceProfile(
+    private fun HuaweiDeviceConfig.toProfile() = DeviceProfile(
         vendor = Vendor.HUAWEI,
         id = id,
-        displayName = displayName,
+        displayName = name,
         capabilities = EarbudsCapabilities(
             ancModes = buildSet {
                 add(com.melody.melodylink.domain.AncMode.OFF)
