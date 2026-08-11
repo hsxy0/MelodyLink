@@ -53,10 +53,16 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Field;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Proxy;
+import java.lang.reflect.Modifier;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.lang.reflect.Array;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.IdentityHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.nio.charset.StandardCharsets;
@@ -712,8 +718,16 @@ public final class HookModule extends XposedModule {
                         activeXiaomiImageProfile = findXiaomiProfileByName((String) deviceName);
                         Object profile = findProfile(chain.getArg(0), DeviceProfileMapper.SONY_TEST_PROFILE_ID, DeviceProfileMapper.SONY_TEST_PROFILE_NAME);
                         if (profile != null) {
-                            log(Log.WARN, TAG, event("mapping registered Sony device " + deviceName
-                                    + " to OPPO Enco X3 id=067410"));
+                            Object mappedProfile = copyWithoutAncStrengthModes(profile);
+                            if (mappedProfile != null) {
+                                log(Log.WARN, TAG, event("mapping registered device " + deviceName
+                                        + " to sanitized OPPO Enco X3 id=067410"));
+                                return mappedProfile;
+                            }
+                            // The preference-level suppressor remains a fail-closed fallback for
+                            // host versions whose whitelist DTO cannot be copied reflectively.
+                            log(Log.WARN, TAG, event("mapping registered device " + deviceName
+                                    + " to OPPO Enco X3 id=067410; DTO strength filtering unavailable"));
                             return profile;
                         }
                         log(Log.ERROR, TAG, "OPPO Enco X3 profile not found; preserving original result");
@@ -2767,6 +2781,117 @@ public final class HookModule extends XposedModule {
             if (id.equals(String.valueOf(itemId)) && name.equals(String.valueOf(itemName))) return item;
         }
         return null;
+    }
+
+    /**
+     * Returns an independent Enco X3 whitelist DTO with Melody's three ANC-intensity
+     * child modes removed. The original entry remains untouched for native OPPO devices.
+     */
+    private Object copyWithoutAncStrengthModes(Object source) {
+        try {
+            Object copy = copyWhitelistValue(source, new IdentityHashMap<>());
+            if (copy == null || copy == source) return null;
+            int removed = removeAncStrengthModes(copy, new IdentityHashMap<>());
+            if (removed <= 0) {
+                log(Log.WARN, TAG, event("Enco X3 whitelist clone contains no removable ANC strength modes"));
+                return null;
+            }
+            return copy;
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "Enco X3 whitelist DTO clone failed", t);
+            return null;
+        }
+    }
+
+    private static Object copyWhitelistValue(Object source, IdentityHashMap<Object, Object> copied)
+            throws ReflectiveOperationException {
+        if (source == null || isWhitelistLeaf(source.getClass())) return source;
+        Object existing = copied.get(source);
+        if (existing != null) return existing;
+        Class<?> type = source.getClass();
+        if (type.isArray()) {
+            int length = Array.getLength(source);
+            Object copy = Array.newInstance(type.getComponentType(), length);
+            copied.put(source, copy);
+            for (int index = 0; index < length; index++) {
+                Array.set(copy, index, copyWhitelistValue(Array.get(source, index), copied));
+            }
+            return copy;
+        }
+        if (source instanceof Collection<?>) {
+            Collection<Object> copy = source instanceof java.util.Set<?>
+                    ? new LinkedHashSet<>() : new ArrayList<>();
+            copied.put(source, copy);
+            for (Object value : (Collection<?>) source) copy.add(copyWhitelistValue(value, copied));
+            return copy;
+        }
+        if (!isMelodyWhitelistValue(type)) return source;
+        Constructor<?> constructor = type.getDeclaredConstructor();
+        constructor.setAccessible(true);
+        Object copy = constructor.newInstance();
+        copied.put(source, copy);
+        for (Class<?> current = type; current != null; current = current.getSuperclass()) {
+            for (Field field : current.getDeclaredFields()) {
+                int modifiers = field.getModifiers();
+                if (Modifier.isStatic(modifiers) || Modifier.isFinal(modifiers) || field.isSynthetic()) continue;
+                field.setAccessible(true);
+                field.set(copy, copyWhitelistValue(field.get(source), copied));
+            }
+        }
+        return copy;
+    }
+
+    private static int removeAncStrengthModes(Object value, IdentityHashMap<Object, Boolean> visited)
+            throws IllegalAccessException {
+        if (value == null || isWhitelistLeaf(value.getClass()) || visited.put(value, Boolean.TRUE) != null) return 0;
+        int removed = 0;
+        if (value instanceof Collection<?>) {
+            Collection<?> collection = (Collection<?>) value;
+            java.util.Iterator<?> iterator = collection.iterator();
+            while (iterator.hasNext()) {
+                Object item = iterator.next();
+                if (isAncStrengthMode(item)) {
+                    iterator.remove();
+                    removed++;
+                } else {
+                    removed += removeAncStrengthModes(item, visited);
+                }
+            }
+            return removed;
+        }
+        Class<?> type = value.getClass();
+        if (type.isArray()) {
+            for (int index = 0; index < Array.getLength(value); index++) {
+                removed += removeAncStrengthModes(Array.get(value, index), visited);
+            }
+            return removed;
+        }
+        if (!isMelodyWhitelistValue(type)) return 0;
+        for (Class<?> current = type; current != null; current = current.getSuperclass()) {
+            for (Field field : current.getDeclaredFields()) {
+                if (Modifier.isStatic(field.getModifiers()) || field.isSynthetic()) continue;
+                field.setAccessible(true);
+                removed += removeAncStrengthModes(field.get(value), visited);
+            }
+        }
+        return removed;
+    }
+
+    private static boolean isAncStrengthMode(Object value) {
+        Object modeType = readField(value, "modeType");
+        if (!(modeType instanceof Number)) return false;
+        int valueType = ((Number) modeType).intValue();
+        return valueType == 3 || valueType == 4 || valueType == 8;
+    }
+
+    private static boolean isMelodyWhitelistValue(Class<?> type) {
+        Package valuePackage = type.getPackage();
+        return valuePackage != null && valuePackage.getName().startsWith("com.oplus.melody.common.data");
+    }
+
+    private static boolean isWhitelistLeaf(Class<?> type) {
+        return type.isPrimitive() || type.isEnum() || type == String.class || Number.class.isAssignableFrom(type)
+                || type == Boolean.class || type == Character.class || type == Class.class;
     }
 
     private static Object readField(Object object, String fieldName) {

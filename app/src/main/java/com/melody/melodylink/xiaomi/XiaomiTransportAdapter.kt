@@ -43,9 +43,7 @@ class XiaomiTransportAdapter(
     private var client: XiaomiSppClient? = null
     private var route: XiaomiDeviceConfig? = null
     private var decoder = XiaomiRcspStreamDecoder()
-    private var policy: XiaomiAncPolicy? = null
-    private var ancWriteVerified = false
-    private var o77TargetInfoVerified = false
+    private var targetInfoVerified = false
     private var currentState: EarbudsState? = null
     private var pending: CompletableDeferred<XiaomiRcspFrame>? = null
     private var pendingOpcode: Int? = null
@@ -63,7 +61,7 @@ class XiaomiTransportAdapter(
         job?.cancel()
         job = scope.launch {
             release(false)
-            route = selected; policy = null; ancWriteVerified = false; o77TargetInfoVerified = false; currentState = null; decoder = XiaomiRcspStreamDecoder(); nextSequence = 0
+            route = selected; targetInfoVerified = false; currentState = null; decoder = XiaomiRcspStreamDecoder(); nextSequence = 0
             listener.onConnecting()
             val active = clientFactory(device.address); client = active
             try {
@@ -108,35 +106,17 @@ class XiaomiTransportAdapter(
     fun setAncMode(mode: AncMode) {
         val selected = route
         val active = client
-        if (selected?.isO77() == true) {
-            if (!isConnected || !o77TargetInfoVerified || active == null) {
-                listener.onAncWriteResult(false, null, "Redmi Buds 6 ANC session is not ready")
-                return
-            }
-            scope.launch {
-                val response = request(active, 0x08, XiaomiRcspCodec.setO77Anc(nextSequence(), mode))
-                if (response?.status == 0 && response.payload.isEmpty()) {
-                    val state = (currentState ?: EarbudsState(capabilities(selected))).copy(ancMode = mode)
-                    currentState = state
-                    listener.onAncWriteResult(true, state, "")
-                } else listener.onAncWriteResult(false, null, "Redmi Buds 6 ANC command was rejected or timed out")
-            }
-            return
-        }
-        val rawMode = policy?.codeFor(mode)
-        if (!isConnected || !ancWriteVerified || selected == null || active == null || rawMode == null) {
-            listener.onAncWriteResult(false, null, "Xiaomi ANC mode is not verified for this session")
+        if (!isConnected || !targetInfoVerified || selected == null || active == null) {
+            listener.onAncWriteResult(false, null, "Xiaomi TargetInfo ANC session is not ready")
             return
         }
         scope.launch {
-            val response = request(active, 0xF2, XiaomiRcspCodec.setAnc(
-                nextSequence(), rawMode, XiaomiRcspCodec.SPP_TARGET_APP
-            ))
-            if (response?.status == 0) {
+            val response = request(active, 0x08, XiaomiRcspCodec.setTargetInfoAnc(nextSequence(), mode))
+            if (response?.status == 0 && response.payload.isEmpty()) {
                 val state = (currentState ?: EarbudsState(capabilities(selected))).copy(ancMode = mode)
                 currentState = state
                 listener.onAncWriteResult(true, state, "")
-            } else listener.onAncWriteResult(false, null, "Xiaomi ANC command did not succeed")
+            } else listener.onAncWriteResult(false, null, "Xiaomi TargetInfo ANC command was rejected or timed out")
         }
     }
 
@@ -145,25 +125,9 @@ class XiaomiTransportAdapter(
             listener.onLog("Xiaomi SPP RX frame opcode=0x${frame.opcode.toString(16).padStart(2, '0')}"
                 + " control=0x${frame.control.toString(16).padStart(2, '0')}"
                 + " parameterBytes=${frame.parameter.size}")
-            if (!frame.isCommand && frame.opcode == 0x02) {
-                updateAncCapability(frame.payload, request)
-            }
-            acceptO77Status(frame)
+            acceptTargetInfoStatus(frame)
             if (!frame.isCommand && frame.opcode == pendingOpcode && frame.sequence == pendingSequence) pending?.complete(frame)
         }
-    }
-
-    private fun updateAncCapability(payload: ByteArray, request: Long) {
-        val capability = extractCapabilityString(payload) ?: return
-        val candidate = XiaomiAncPolicy.fromCapabilityString(capability)
-        if (candidate == null) {
-            listener.onLog("Xiaomi SPP target-info capability table does not define an unambiguous three-mode ANC mapping")
-            return
-        }
-        if (policy == candidate) return
-        policy = candidate
-        listener.onLog("Xiaomi SPP target-info confirmed a three-mode ANC mapping")
-        if (isConnected) scope.launch { readInitialState(request) }
     }
 
     private suspend fun readInitialState(request: Long) {
@@ -171,39 +135,12 @@ class XiaomiTransportAdapter(
         val targetInfo = request(active, 0x02, XiaomiRcspCodec.getTargetInfo(
             nextSequence(), XiaomiRcspCodec.SPP_TARGET_APP
         ))
-        if (route?.isO77() == true) {
-            o77TargetInfoVerified = targetInfo?.status == 0
-            targetInfo?.let(::acceptO77Status)
-            if (!o77TargetInfoVerified) listener.onLog("Redmi Buds 6 target-info read was not confirmed")
-        }
-        if (request != generation.get()) return
-        val response = request(active, 0xF3, XiaomiRcspCodec.getConfigs(
-            nextSequence(), targetApp = XiaomiRcspCodec.SPP_TARGET_APP
-        ))
+        targetInfoVerified = targetInfo?.status == 0
+        targetInfo?.let(::acceptTargetInfoStatus)
+        if (!targetInfoVerified) listener.onLog("Xiaomi TargetInfo read was not confirmed")
         if (request != generation.get()) return
         val selected = route ?: return
-        val config = response?.takeIf { it.status == 0 }?.let { XiaomiConfigParser.parse(it.payload) }
-        if (response == null) {
-            listener.onLog("Xiaomi SPP F3 returned no response")
-        } else if (response.status != 0) {
-            listener.onLog("Xiaomi SPP F3 returned status=${response.status}")
-        } else if (config == null) {
-            listener.onLog("Xiaomi SPP F3 configuration payload is malformed")
-        } else {
-            listener.onLog("Xiaomi SPP F3 configuration ids=" + config.joinToString(",") {
-                "0x${it.id.toString(16).padStart(4, '0')}:${it.data.size}"
-            })
-        }
-        val rawAnc = config?.firstOrNull { it.id == 0x000B }?.data
-        rawAnc?.let {
-            listener.onLog("Xiaomi SPP F3 ANC 000B=${it.toHex()}")
-        }
-        val ancMode = if (selected.isO77()) currentState?.ancMode else rawAnc?.let { policy?.modeFor(it) }
-        if (rawAnc != null && policy == null) {
-            listener.onLog("Xiaomi SPP ANC remains read-only: target capability mode table is unavailable")
-        }
-        ancWriteVerified = ancMode != null
-        val state = EarbudsState(capabilities(selected), ancMode = ancMode,
+        val state = EarbudsState(capabilities(selected), ancMode = currentState?.ancMode,
             battery = currentState?.battery.orEmpty())
         currentState = state
         listener.onConnected(state)
@@ -227,13 +164,12 @@ class XiaomiTransportAdapter(
 
     private fun nextSequence(): Int = nextSequence++ and 0xFF
     private fun capabilities(config: XiaomiDeviceConfig) = EarbudsCapabilities(
-        ancModes = if (policy == null) emptySet() else setOf(AncMode.OFF, AncMode.NOISE_CANCELING, AncMode.TRANSPARENCY),
+        ancModes = if (targetInfoVerified) setOf(AncMode.OFF, AncMode.NOISE_CANCELING, AncMode.TRANSPARENCY) else emptySet(),
         batteryParts = config.batteryParts,
     )
 
-    private fun acceptO77Status(frame: XiaomiRcspFrame) {
-        if (route?.isO77() != true) return
-        val update = XiaomiO77StatusParser.parse(frame) ?: return
+    private fun acceptTargetInfoStatus(frame: XiaomiRcspFrame) {
+        val update = XiaomiTargetInfoStatusParser.parse(frame) ?: return
         val selected = route ?: return
         val state = (currentState ?: EarbudsState(capabilities(selected))).copy(
             ancMode = update.ancMode ?: currentState?.ancMode,
@@ -242,30 +178,15 @@ class XiaomiTransportAdapter(
         currentState = state
         listener.onStateChanged(state)
         if (update.battery != null) {
-            listener.onLog("Redmi Buds 6 SPP battery state received")
+            listener.onLog("Xiaomi TargetInfo SPP battery state received")
             listener.onBatteryState(state)
         }
     }
 
-    private fun XiaomiDeviceConfig.isO77() = id == "xiaomi.redmi_buds_6"
-
     private suspend fun release(notify: Boolean) {
-        client?.close(); client = null; route = null; policy = null; ancWriteVerified = false; o77TargetInfoVerified = false; currentState = null; isConnected = false
+        client?.close(); client = null; route = null; targetInfoVerified = false; currentState = null; isConnected = false
         if (notify) listener.onDisconnected()
     }
 
     fun releaseResources() { disconnect(); scope.cancel() }
-
-    private fun extractCapabilityString(value: ByteArray): String? {
-        val text = buildString {
-            value.forEach { byte -> append(if (byte.toInt().and(0xFF) in 32..126) byte.toInt().and(0xFF).toChar() else '\n') }
-        }
-        return text.lineSequence().firstOrNull { candidate ->
-            candidate.count { character -> character == ',' } == 3
-                && candidate.length <= 512
-                && candidate.split(',').getOrNull(1)?.contains(';') == true
-        }
-    }
-
-    private fun ByteArray.toHex(): String = joinToString("") { "%02X".format(it.toInt() and 0xFF) }
 }

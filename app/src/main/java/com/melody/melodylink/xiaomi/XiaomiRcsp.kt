@@ -32,31 +32,15 @@ object XiaomiRcspCodec {
         targetApp = targetApp,
     )
 
-    fun getConfigs(
-        sequence: Int,
-        ids: IntArray = DEFAULT_CONFIG_IDS,
-        targetApp: Int = BLE_TARGET_APP,
-    ): ByteArray = command(
-        opcode = 0xF3,
-        sequence = sequence,
-        payload = ids.flatMap { listOf((it ushr 8).toByte(), it.toByte()) }.toByteArray(),
-        targetApp = targetApp,
-    )
-
-    fun setAnc(sequence: Int, rawMode: ByteArray, targetApp: Int = BLE_TARGET_APP): ByteArray {
-        require(rawMode.size == 2) { "Xiaomi ANC mode must contain two bytes" }
-        return command(0xF2, sequence, byteArrayOf(0x04, 0x00, 0x0B) + rawMode, targetApp = targetApp)
-    }
-
-    /** Redmi Buds 6 (O77) uses SetTargetInfo, not the generic F2 configuration item. */
-    fun setO77Anc(sequence: Int, mode: AncMode): ByteArray = command(
+    /** Xiaomi SPP devices use SetTargetInfo for the verified three-mode ANC control. */
+    fun setTargetInfoAnc(sequence: Int, mode: AncMode): ByteArray = command(
         opcode = 0x08,
         sequence = sequence,
-        payload = byteArrayOf(0x02, 0x04, o77AncValue(mode).toByte()),
+        payload = byteArrayOf(0x02, 0x04, targetInfoAncValue(mode).toByte()),
         targetApp = SPP_TARGET_APP,
     )
 
-    private fun o77AncValue(mode: AncMode): Int = when (mode) {
+    private fun targetInfoAncValue(mode: AncMode): Int = when (mode) {
         AncMode.OFF -> 0x00
         AncMode.NOISE_CANCELING -> 0x01
         AncMode.AMBIENT_SOUND, AncMode.TRANSPARENCY -> 0x02
@@ -82,17 +66,16 @@ object XiaomiRcspCodec {
         return XiaomiRcspFrame(frame[3].toInt() and 0xFF, frame[4].toInt() and 0xFF, frame.copyOfRange(7, frame.lastIndex))
     }
 
-    val DEFAULT_CONFIG_IDS = intArrayOf(0x0001, 0x0002, 0x0003, 0x0004, 0x000A, 0x000B, 0x000F, 0x0024)
 }
 
 /**
- * Redmi Buds 6 publishes state on the SPP target-app channel.  Its payload is a
+ * Xiaomi SPP devices publish state on the target-app channel. Its payload is a
  * sequence of LEN | TYPE | DATA TLVs: type 7 is returned by GetTargetInfo and
  * type 0 is sent by device-status notifications.  Both hold left/right/case bytes.
  */
-object XiaomiO77StatusParser {
+object XiaomiTargetInfoStatusParser {
     fun parse(frame: XiaomiRcspFrame): EarbudsStateUpdate? {
-        // O77 replies use target-app 4, while unsolicited 0x0E status notifications
+        // TargetInfo replies use target-app 4, while unsolicited 0x0E status notifications
         // arrive on its companion target-app 7 channel (control 0xC7 in device logs).
         if (frame.control and 0x0F !in setOf(XiaomiRcspCodec.SPP_TARGET_APP, 0x07)) return null
         val allowedTypes = when {
@@ -184,44 +167,5 @@ class XiaomiRcspStreamDecoder {
             if (bytes[index] == 0xFE.toByte() && bytes[index + 1] == 0xDC.toByte() && bytes[index + 2] == 0xBA.toByte()) return index
         }
         return -1
-    }
-}
-
-data class XiaomiConfigItem(val id: Int, val data: ByteArray)
-
-object XiaomiConfigParser {
-    fun parse(responsePayload: ByteArray): List<XiaomiConfigItem>? {
-        val result = mutableListOf<XiaomiConfigItem>()
-        var offset = 0
-        while (offset < responsePayload.size) {
-            val length = responsePayload[offset].toInt() and 0xFF
-            if (length < 2 || offset + length >= responsePayload.size) return null
-            val id = ((responsePayload[offset + 1].toInt() and 0xFF) shl 8) or (responsePayload[offset + 2].toInt() and 0xFF)
-            result += XiaomiConfigItem(id, responsePayload.copyOfRange(offset + 3, offset + length + 1))
-            offset += length + 1
-        }
-        return result
-    }
-}
-
-/** Only unambiguous no-level modes are admitted. Unknown and strength-only mode tables stay read-only. */
-data class XiaomiAncPolicy private constructor(private val codes: Map<AncMode, ByteArray>) {
-    fun codeFor(mode: AncMode): ByteArray? = codes[mode]?.copyOf()
-    fun modeFor(raw: ByteArray): AncMode? = codes.entries.firstOrNull { it.value.contentEquals(raw) }?.key
-
-    companion object {
-        fun fromCapabilityString(value: String): XiaomiAncPolicy? {
-            val fields = value.split(',')
-            if (fields.size < 2) return null
-            val modes = fields[1].split(';').map(String::trim).filter { it.matches(Regex("[0-9A-Fa-f]{4}")) }.map { it.uppercase() }.toSet()
-            if (!setOf("0100", "0101", "0201").all(modes::contains)) return null
-            if (modes.any { it.startsWith("01") && it !in setOf("0100", "0101") }) return null
-            if (modes.any { it.startsWith("02") && it != "0201" }) return null
-            return XiaomiAncPolicy(mapOf(
-                AncMode.OFF to byteArrayOf(0x01, 0x00),
-                AncMode.NOISE_CANCELING to byteArrayOf(0x01, 0x01),
-                AncMode.TRANSPARENCY to byteArrayOf(0x02, 0x01),
-            ))
-        }
     }
 }
