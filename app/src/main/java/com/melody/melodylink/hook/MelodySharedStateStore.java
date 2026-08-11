@@ -183,4 +183,5 @@ final class MelodySharedStateStore {
             this.nonce = nonce;
         }
     }
+
 }

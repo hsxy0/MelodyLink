@@ -2,11 +2,15 @@ package com.melody.melodylink.hook;
 
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothHeadset;
 import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.Application;
 import android.content.pm.ApplicationInfo;
 import android.content.Context;
+import android.content.BroadcastReceiver;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.ContextWrapper;
 import android.content.res.AssetManager;
 import android.net.Uri;
@@ -27,11 +31,17 @@ import com.melody.melodylink.vendor.sony.SonyDeviceCatalogAdapter;
 import com.melody.melodylink.vendor.sony.SonyEarbudsFacade;
 import com.melody.melodylink.vendor.samsung.SamsungEarbudsFacade;
 import com.melody.melodylink.vendor.huawei.HuaweiEarbudsFacade;
+import com.melody.melodylink.vendor.xiaomi.XiaomiEarbudsFacade;
 import com.melody.melodylink.huawei.config.HuaweiDeviceCatalog;
 import com.melody.melodylink.huawei.config.HuaweiConfigIssue;
 import com.melody.melodylink.huawei.config.HuaweiConfigLoadResult;
 import com.melody.melodylink.huawei.config.HuaweiConfigLoader;
 import com.melody.melodylink.huawei.config.HuaweiDeviceConfig;
+import com.melody.melodylink.xiaomi.config.XiaomiConfigIssue;
+import com.melody.melodylink.xiaomi.config.XiaomiConfigLoadResult;
+import com.melody.melodylink.xiaomi.config.XiaomiConfigLoader;
+import com.melody.melodylink.xiaomi.config.XiaomiDeviceCatalog;
+import com.melody.melodylink.xiaomi.config.XiaomiDeviceConfig;
 import com.melody.melodylink.samsung.config.SamsungGalaxyBudsCatalog;
 import com.melody.melodylink.sony.config.SonyConfigIssue;
 import com.melody.melodylink.sony.config.SonyConfigLoadResult;
@@ -74,10 +84,14 @@ public final class HookModule extends XposedModule {
     private volatile BluetoothDevice targetSonyDevice;
     private volatile BluetoothDevice targetSamsungDevice;
     private volatile BluetoothDevice targetHuaweiDevice;
+    private volatile BluetoothDevice targetXiaomiDevice;
+    /** Host A2DP/HFP state remains authoritative for UI connection, even if AF00 control setup fails. */
+    private volatile boolean xiaomiHostConnected;
     private volatile Object earphoneRepository;
     private volatile MelodySharedStateStore sharedStateStore;
     private final MelodySessionState sonySessionState = new MelodySessionState();
     private final MelodySessionState huaweiSessionState = new MelodySessionState();
+    private final MelodySessionState xiaomiSessionState = new MelodySessionState();
     private volatile ClassLoader melodyClassLoader;
     private volatile CompletableFuture<Object> pendingNoiseWrite;
     private volatile AncMode pendingAncMode;
@@ -94,6 +108,7 @@ public final class HookModule extends XposedModule {
     private volatile AssetManager sonyModuleAssets;
     private volatile SonyDeviceConfig activeSonyImageProfile;
     private volatile HuaweiDeviceConfig activeHuaweiImageProfile;
+    private volatile XiaomiDeviceConfig activeXiaomiImageProfile;
     private volatile boolean retainSharedSonyStateAfterCommandDisconnect;
     private volatile boolean activityLifecycleRegistered;
     private volatile Activity detailActivity;
@@ -104,6 +119,29 @@ public final class HookModule extends XposedModule {
     private final Map<SonyAdvancedSettingId, Object> advancedPreferences = new ConcurrentHashMap<>();
     private volatile Object huaweiLowLatencyPreference;
     private volatile Boolean confirmedHuaweiLowLatency;
+    private volatile XiaomiEarbudsFacade xiaomiTransport;
+    private volatile boolean xiaomiBatteryReceiverRegistered;
+    private final BroadcastReceiver xiaomiBatteryReceiver = new BroadcastReceiver() {
+        @Override public void onReceive(Context context, Intent intent) {
+            if (!BluetoothHeadset.ACTION_VENDOR_SPECIFIC_HEADSET_EVENT.equals(intent.getAction()) || targetXiaomiDevice == null) return;
+            BluetoothDevice source = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice.class);
+            if (source != null && !source.equals(targetXiaomiDevice)) return;
+            Object value = intent.getSerializableExtra(BluetoothHeadset.EXTRA_VENDOR_SPECIFIC_HEADSET_EVENT_ARGS);
+            XiaomiEarbudsFacade transport = xiaomiTransport;
+            if (transport == null) return;
+            java.util.ArrayList<String> arguments = new java.util.ArrayList<>();
+            if (value instanceof Object[]) {
+                for (Object item : (Object[]) value) if (item instanceof String) arguments.add((String) item);
+            } else if (value instanceof String) {
+                arguments.add((String) value);
+            }
+            if (arguments.isEmpty()) {
+                log(Log.INFO, TAG, event("Xiaomi vendor battery event ignored: no string arguments"));
+                return;
+            }
+            transport.acceptVendorBatteryEvent(arguments);
+        }
+    };
     private final HuaweiEarbudsFacade huaweiTransport = new HuaweiEarbudsFacade(new HuaweiEarbudsFacade.Listener() {
         @Override public void onConnecting() { log(Log.INFO, TAG, event("Huawei RFCOMM connecting")); }
         @Override public void onConnected(EarbudsState state) {
@@ -160,6 +198,68 @@ public final class HookModule extends XposedModule {
         }
         @Override public void onLog(String message) { log(Log.INFO, TAG, event(message)); }
     });
+
+    private XiaomiEarbudsFacade ensureXiaomiTransport() {
+        XiaomiEarbudsFacade existing = xiaomiTransport;
+        if (existing != null) return existing;
+        Application application = currentApplication();
+        if (application == null) return null;
+        synchronized (this) {
+            if (xiaomiTransport != null) return xiaomiTransport;
+            xiaomiTransport = new XiaomiEarbudsFacade(application, new XiaomiEarbudsFacade.Listener() {
+                @Override public void onConnecting() { log(Log.INFO, TAG, event("Xiaomi SPP connecting")); }
+                @Override public void onConnected(EarbudsState state) {
+                    xiaomiSessionState.acceptAnc(state);
+                    xiaomiSessionState.acceptBattery(state);
+                    writeSharedXiaomiState();
+                    publishBatteryState(state, "Xiaomi connected");
+                    refreshTargetRepository("Xiaomi connected");
+                    log(Log.INFO, TAG, event("Xiaomi SPP connected; ANC state=" + state.getAncMode()));
+                }
+                @Override public void onStateChanged(EarbudsState state) {
+                    xiaomiSessionState.acceptAnc(state);
+                    xiaomiSessionState.acceptBattery(state);
+                    writeSharedXiaomiState();
+                    refreshTargetRepository("Xiaomi SPP status notification");
+                    log(Log.INFO, TAG, event("Xiaomi SPP state ANC=" + state.getAncMode()));
+                }
+                @Override public void onBatteryState(EarbudsState state) {
+                    xiaomiSessionState.acceptBattery(state);
+                    writeSharedXiaomiState();
+                    publishBatteryState(state, "Xiaomi battery event");
+                    refreshTargetRepository("Xiaomi battery event");
+                }
+                @Override public void onAncWriteResult(boolean success, EarbudsState state, String reason) {
+                    CompletableFuture<Object> future;
+                    synchronized (HookModule.this) { future = pendingNoiseWrite; pendingNoiseWrite = null; }
+                    if (success && state != null) {
+                        xiaomiSessionState.acceptAnc(state);
+                        writeSharedXiaomiState();
+                        refreshTargetRepository("Xiaomi ANC write");
+                    }
+                    if (future == null) return;
+                    if (success) {
+                        Object result = createSetCommandState(0);
+                        if (result != null) future.complete(result);
+                        else future.completeExceptionally(new IllegalStateException("Xiaomi ANC result DTO unavailable"));
+                    } else future.completeExceptionally(new IllegalStateException(reason));
+                }
+                @Override public void onDisconnected() {
+                    failPendingNoiseWrite("Xiaomi transport disconnected");
+                    xiaomiSessionState.clear();
+                    refreshTargetRepository("Xiaomi disconnected");
+                }
+                @Override public void onFailed(String reason) {
+                    failPendingNoiseWrite(reason);
+                    xiaomiSessionState.clear();
+                    refreshTargetRepository("Xiaomi failed");
+                    log(Log.WARN, TAG, event("Xiaomi BLE failed: " + reason));
+                }
+                @Override public void onLog(String message) { log(Log.INFO, TAG, event(message)); }
+            });
+            return xiaomiTransport;
+        }
+    }
 
     private final SamsungEarbudsFacade samsungTransport = new SamsungEarbudsFacade(new SamsungEarbudsFacade.Listener() {
         @Override
@@ -396,6 +496,8 @@ public final class HookModule extends XposedModule {
             hookNamed(loader, "com.oplus.melody.ui.component.detail.opsreduction.buttonseekbar.NoiseReductionButtonSeekBarView", "h", 0, "opsReductionSwitchToCurrentMode");
             hookNamed(loader, "com.oplus.melody.ui.component.detail.opsreduction.buttonseekbar.NoiseReductionButtonSeekBarView", "i", 0, "opsReductionUpdateActionView");
             hookNamed(loader, "com.oplus.melody.ui.component.detail.opsreduction.buttonseekbar.NoiseReductionButtonSeekBarView", "d", 0, "opsReductionApplyMode");
+            // Melody 16.8.3's child-mode callback supplies the stable modeType before it is
+            // converted to the opaque protocol index passed to EarphoneRepository.s0.
             startForegroundStateWatcher();
         } catch (Throwable t) {
             log(Log.ERROR, TAG, "hook setup failed", t);
@@ -475,6 +577,7 @@ public final class HookModule extends XposedModule {
                         Object preference = chain.getArg(0);
                         Object result = chain.proceed();
                         removeUnsupportedDetailCategory(preference);
+                        hideAncStrengthPreference(preference);
                         return result;
                     }
                     if ("detailActivityCreate".equals(label)) {
@@ -590,7 +693,8 @@ public final class HookModule extends XposedModule {
                     if ("noiseWrite".equals(label) && isTargetAddress(chain.getArg(1))) {
                         if (hasPendingNoiseWrite()) {
                             log(Log.INFO, TAG, event("ignored duplicate Sony noise update while ANC write is pending"));
-                        } else if ((sonyTransport.isConnected() || samsungTransport.isConnected() || huaweiTransport.isConnected())
+                        } else if ((sonyTransport.isConnected() || samsungTransport.isConnected() || huaweiTransport.isConnected()
+                                || (xiaomiTransport != null && xiaomiTransport.isConnected()))
                                 && startSonyNoiseWrite(chain.getArg(2))) {
                             log(Log.INFO, TAG, event("routed target noise reduction write to vendor RFCOMM"));
                         } else {
@@ -601,9 +705,11 @@ public final class HookModule extends XposedModule {
                     Object deviceName = arity > 2 ? chain.getArg(2) : null;
                     if ("whitelist".equals(label) && deviceName instanceof String
                             && (isRegisteredSonyName((String) deviceName)
-                            || isRegisteredHuaweiName((String) deviceName))) {
+                            || isRegisteredHuaweiName((String) deviceName)
+                            || isRegisteredXiaomiName((String) deviceName))) {
                         activeSonyImageProfile = findSonyProfileByName((String) deviceName);
                         activeHuaweiImageProfile = findHuaweiProfileByName((String) deviceName);
+                        activeXiaomiImageProfile = findXiaomiProfileByName((String) deviceName);
                         Object profile = findProfile(chain.getArg(0), DeviceProfileMapper.SONY_TEST_PROFILE_ID, DeviceProfileMapper.SONY_TEST_PROFILE_NAME);
                         if (profile != null) {
                             log(Log.WARN, TAG, event("mapping registered Sony device " + deviceName
@@ -718,6 +824,20 @@ public final class HookModule extends XposedModule {
                 log(Log.WARN, TAG, event("Sony connection skipped: DeviceInfo has no registered BluetoothDevice"));
                 return false;
             }
+            if (isRegisteredXiaomiDevice((BluetoothDevice) device)) {
+                targetXiaomiDevice = (BluetoothDevice) device;
+                xiaomiHostConnected = true;
+                rememberTargetAddress((String) address);
+                // The foreground process cannot see this process's in-memory host marker.
+                // Publish it before AF00 setup, since A2DP/HFP is already connected here.
+                writeSharedXiaomiState();
+                XiaomiEarbudsFacade transport = ensureXiaomiTransport();
+                if (transport == null) return false;
+                log(Log.INFO, TAG, event("starting Xiaomi SPP session name=" + ((BluetoothDevice) device).getName()
+                        + " addressHash=" + Integer.toHexString(((String) address).hashCode())));
+                transport.connect((BluetoothDevice) device);
+                return true;
+            }
             if (isRegisteredHuaweiDevice((BluetoothDevice) device)) {
                 targetHuaweiDevice = (BluetoothDevice) device;
                 rememberTargetAddress((String) address);
@@ -802,7 +922,10 @@ public final class HookModule extends XposedModule {
             int modeIndex = (Integer) value;
             com.melody.melodylink.domain.AncMode domainMode = MelodyCommandBridge.INSTANCE.ancMode(modeIndex);
             if (domainMode == null) return false;
-            if (targetHuaweiDevice != null && isRegisteredHuaweiDevice(targetHuaweiDevice)) {
+            if (targetXiaomiDevice != null && isRegisteredXiaomiDevice(targetXiaomiDevice)) {
+                XiaomiEarbudsFacade transport = ensureXiaomiTransport();
+                if (transport != null) transport.setAncMode(domainMode);
+            } else if (targetHuaweiDevice != null && isRegisteredHuaweiDevice(targetHuaweiDevice)) {
                 huaweiTransport.setAncMode(domainMode);
             } else if (targetSamsungDevice != null && isRegisteredSamsungDevice(targetSamsungDevice)) {
                 samsungTransport.setAncMode(domainMode);
@@ -837,7 +960,11 @@ public final class HookModule extends XposedModule {
             pendingAncMode = domainMode;
             pendingBatteryRefresh = false;
         }
-        if (targetHuaweiDevice != null && isRegisteredHuaweiDevice(targetHuaweiDevice)
+        if (targetXiaomiDevice != null && isRegisteredXiaomiDevice(targetXiaomiDevice)
+                && ensureXiaomiTransport() != null && ensureXiaomiTransport().isConnected()) {
+            pendingAncMode = null;
+            ensureXiaomiTransport().setAncMode(domainMode);
+        } else if (targetHuaweiDevice != null && isRegisteredHuaweiDevice(targetHuaweiDevice)
                 && huaweiTransport.isConnected()) {
             pendingAncMode = null;
             huaweiTransport.setAncMode(domainMode);
@@ -932,9 +1059,12 @@ public final class HookModule extends XposedModule {
             }
             SonyConfigLoadResult result = SonyConfigLoader.INSTANCE.fromAssets(moduleAssets);
             HuaweiConfigLoadResult huaweiResult = HuaweiConfigLoader.INSTANCE.fromAssets(moduleAssets);
+            XiaomiConfigLoadResult xiaomiResult = XiaomiConfigLoader.INSTANCE.fromAssets(moduleAssets);
             sonyTransport.setCatalog(new SonyDeviceCatalogAdapter(result.getRegistry()));
             deviceBridge.setRegistry(result.getRegistry());
             HuaweiDeviceCatalog.INSTANCE.setRegistry(huaweiResult.getRegistry());
+            XiaomiDeviceCatalog.INSTANCE.setRegistry(xiaomiResult.getRegistry());
+            registerXiaomiBatteryReceiver(application);
             sonyModuleAssets = moduleAssets;
             for (SonyConfigIssue issue : result.getIssues()) {
                 log(Log.WARN, TAG, event("Sony configuration skipped " + issue.getPath()
@@ -944,14 +1074,53 @@ public final class HookModule extends XposedModule {
                 log(Log.WARN, TAG, event("Huawei configuration skipped " + issue.getPath()
                         + ": " + issue.getMessage()));
             }
+            for (XiaomiConfigIssue issue : xiaomiResult.getIssues()) {
+                log(Log.WARN, TAG, event("Xiaomi configuration skipped " + issue.getPath()
+                        + ": " + issue.getMessage()));
+            }
             sonyConfigInitialized = true;
             log(Log.INFO, TAG, event("loaded " + result.getRegistry().getProfiles().size()
-                    + " Sony and " + huaweiResult.getRegistry().getProfiles().size()
-                    + " Huawei device profiles from " + moduleApkPath));
+                    + " Sony, " + huaweiResult.getRegistry().getProfiles().size()
+                    + " Huawei and " + xiaomiResult.getRegistry().getProfiles().size()
+                    + " Xiaomi device profiles from " + moduleApkPath));
             return true;
         } catch (Throwable t) {
             log(Log.ERROR, TAG, "Sony configuration initialization failed", t);
             return false;
+        }
+    }
+
+    /** Melody's child-menu is for ANC intensity, which this module intentionally does not support. */
+    private void hideAncStrengthPreference(Object preference) {
+        if (preference == null || !hasMappedDeviceActive()) return;
+        try {
+            Object key = preference.getClass().getMethod("getKey").invoke(preference);
+            if (!"pref_noise_menu".equals(key) && !"pref_noise_menu_category".equals(key)) return;
+            Method setVisible = preference.getClass().getMethod("setVisible", boolean.class);
+            setVisible.invoke(preference, false);
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "ANC strength preference suppression failed", t);
+        }
+    }
+
+    private boolean hasMappedDeviceActive() {
+        return (targetSonyDevice != null && isRegisteredSonyName(targetSonyDevice.getName()))
+                || (targetSamsungDevice != null && isRegisteredSamsungDevice(targetSamsungDevice))
+                || (targetHuaweiDevice != null && isRegisteredHuaweiDevice(targetHuaweiDevice))
+                || (targetXiaomiDevice != null && isRegisteredXiaomiDevice(targetXiaomiDevice));
+    }
+
+    private synchronized void registerXiaomiBatteryReceiver(Application application) {
+        if (xiaomiBatteryReceiverRegistered) return;
+        try {
+            application.registerReceiver(xiaomiBatteryReceiver,
+                    new IntentFilter(BluetoothHeadset.ACTION_VENDOR_SPECIFIC_HEADSET_EVENT),
+                    // This broadcast originates in the Bluetooth system process.  Android 13+
+                    // drops it for a NOT_EXPORTED dynamic receiver before onReceive is called.
+                    Context.RECEIVER_EXPORTED);
+            xiaomiBatteryReceiverRegistered = true;
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "Xiaomi battery event receiver registration failed", t);
         }
     }
 
@@ -981,6 +1150,8 @@ public final class HookModule extends XposedModule {
         return replaceSonyProductImage(owner, viewModelField, addressField, nameField,
                 imageField, loadingField, surface, fallbackImageView)
                 || replaceHuaweiProductImage(owner, viewModelField, addressField, nameField,
+                imageField, loadingField, surface, fallbackImageView)
+                || replaceXiaomiProductImage(owner, viewModelField, addressField, nameField,
                 imageField, loadingField, surface, fallbackImageView);
     }
 
@@ -1172,6 +1343,14 @@ public final class HookModule extends XposedModule {
         return match != null ? match.getRoute() : null;
     }
 
+    private XiaomiDeviceConfig findXiaomiProfileByName(String name) {
+        com.melody.melodylink.xiaomi.config.XiaomiDeviceMatch match = XiaomiDeviceCatalog.INSTANCE.find(
+                new com.melody.melodylink.domain.DeviceIdentity(name, null,
+                        java.util.Collections.emptySet(), null)
+        );
+        return match != null ? match.getRoute() : null;
+    }
+
     private File materializeHuaweiImage(HuaweiDeviceConfig profile) {
         Application application = currentApplication();
         AssetManager assets = sonyModuleAssets;
@@ -1192,6 +1371,51 @@ public final class HookModule extends XposedModule {
             return output.isFile() && output.length() > 0L ? output : null;
         } catch (Throwable t) {
             log(Log.WARN, TAG, "Huawei image materialization failed", t);
+            return null;
+        }
+    }
+
+    private boolean replaceXiaomiProductImage(
+            Object owner, String viewModelField, String addressField, String nameField,
+            String imageField, String loadingField, String surface, ImageView fallbackImageView
+    ) {
+        Object viewModel = readField(owner, viewModelField);
+        String address = asString(readField(viewModel, addressField));
+        XiaomiDeviceConfig profile = findXiaomiProfileByName(asString(readField(viewModel, nameField)));
+        if (profile == null) profile = activeXiaomiImageProfile;
+        if (profile == null || profile.getImage().trim().isEmpty()) return false;
+        Object imageValue = readField(owner, imageField);
+        ImageView imageView = imageValue instanceof ImageView ? (ImageView) imageValue : fallbackImageView;
+        if (imageView == null) return false;
+        File imageFile = materializeXiaomiImage(profile);
+        if (imageFile == null) return false;
+        imageView.setImageURI(Uri.fromFile(imageFile));
+        imageView.setVisibility(View.VISIBLE);
+        hideLoadingView(readField(owner, loadingField));
+        if (address != null && isTargetAddress(address)) rememberTargetAddress(address);
+        log(Log.INFO, TAG, event("replaced Xiaomi " + surface + " product image profile=" + profile.getId()));
+        return true;
+    }
+
+    private File materializeXiaomiImage(XiaomiDeviceConfig profile) {
+        Application application = currentApplication();
+        AssetManager assets = sonyModuleAssets;
+        String assetPath = profile.getImage();
+        if (application == null || assets == null || !assetPath.startsWith("xiaomi/images/")) return null;
+        File directory = new File(application.getFilesDir(), "melodylink/xiaomi-images");
+        File output = new File(directory, profile.getId().replace('.', '_') + "-" + new File(assetPath).getName());
+        try {
+            if (output.isFile() && output.length() > 0L) return output;
+            if (!directory.isDirectory() && !directory.mkdirs()) return null;
+            try (java.io.InputStream input = assets.open(assetPath);
+                 FileOutputStream stream = new FileOutputStream(output, false)) {
+                byte[] buffer = new byte[8192];
+                int count;
+                while ((count = input.read(buffer)) != -1) stream.write(buffer, 0, count);
+            }
+            return output.isFile() && output.length() > 0L ? output : null;
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "Xiaomi image materialization failed", t);
             return null;
         }
     }
@@ -1309,7 +1533,8 @@ public final class HookModule extends XposedModule {
     @SuppressLint("MissingPermission")
     private boolean isTargetDevice(BluetoothDevice device) {
         try {
-            return isRegisteredSonyName(device.getName()) || isRegisteredSamsungDevice(device) || isRegisteredHuaweiDevice(device);
+            return isRegisteredSonyName(device.getName()) || isRegisteredSamsungDevice(device)
+                    || isRegisteredHuaweiDevice(device) || isRegisteredXiaomiDevice(device);
         } catch (Throwable ignored) {
             return false;
         }
@@ -1371,6 +1596,8 @@ public final class HookModule extends XposedModule {
         return targetAddress != null && (sonyTransport.isConnected()
                 || samsungTransport.isConnected()
                 || huaweiTransport.isConnected()
+                || (xiaomiTransport != null && xiaomiTransport.isConnected())
+                || (targetXiaomiDevice != null && xiaomiHostConnected)
                 || targetAddress.equalsIgnoreCase(readSharedSonyAddress()));
     }
 
@@ -1444,6 +1671,24 @@ public final class HookModule extends XposedModule {
         }
     }
 
+    /**
+     * Mirrors the host Bluetooth connection rather than AF00 readiness.  The target app has
+     * a separate foreground process, so the A2DP/HFP connection marker must cross processes
+     * even when Xiaomi's optional control channel cannot be established.
+     */
+    private void writeSharedXiaomiState() {
+        if (!isPrimaryProcess() || targetAddress == null || targetXiaomiDevice == null || !xiaomiHostConnected) return;
+        File file = sharedStateFile();
+        if (file == null) return;
+        int mode = MelodyStateBridge.INSTANCE.ancModeIndex(xiaomiSessionState.getAnc());
+        if (MelodySharedStateStore.writeState(file, targetAddress, android.os.Process.myPid(), mode, null, null)) {
+            log(Log.INFO, TAG, event("shared Xiaomi host connection published addressHash="
+                    + Integer.toHexString(targetAddress.hashCode()) + " mode=" + mode));
+        } else {
+            log(Log.WARN, TAG, "shared Xiaomi state write failed");
+        }
+    }
+
     private void clearHuaweiSessionState() {
         huaweiSessionState.clear();
         if (!isPrimaryProcess() || targetHuaweiDevice == null) return;
@@ -1502,8 +1747,11 @@ public final class HookModule extends XposedModule {
         sonyTransport.disconnect();
         samsungTransport.disconnect();
         huaweiTransport.disconnect();
+        if (xiaomiTransport != null) xiaomiTransport.disconnect();
         targetSamsungDevice = null;
         targetHuaweiDevice = null;
+        targetXiaomiDevice = null;
+        xiaomiHostConnected = false;
         refreshTargetRepository(reason);
     }
 
@@ -2031,6 +2279,25 @@ public final class HookModule extends XposedModule {
         Object preference = advancedPreferences.get(id);
         if (preference == null) return;
         mainHandler.post(() -> setPreferenceValue(preference, "setEnabled", enabled));
+    }
+
+    private boolean isRegisteredXiaomiName(String bluetoothName) {
+        return initializeSonyConfig() && findXiaomiProfileByName(bluetoothName) != null;
+    }
+
+    @SuppressLint("MissingPermission")
+    private boolean isRegisteredXiaomiDevice(BluetoothDevice device) {
+        try {
+            java.util.Set<String> uuids = new java.util.HashSet<>();
+            if (device.getUuids() != null) {
+                for (android.os.ParcelUuid uuid : device.getUuids()) uuids.add(uuid.getUuid().toString());
+            }
+            return XiaomiDeviceCatalog.INSTANCE.find(
+                    new com.melody.melodylink.domain.DeviceIdentity(device.getName(), device.getAddress(), uuids, null)
+            ) != null;
+        } catch (Throwable ignored) {
+            return false;
+        }
     }
 
     private void addHuaweiLowLatencyPreference(Object category, ClassLoader loader, Activity activity, int order) {

@@ -8,11 +8,13 @@ enum class BatteryPart { LEFT, RIGHT, CASE, SINGLE }
 
 data class BatteryValue(val percent: Int, val charging: Boolean = false)
 
-data class DeviceIdentity(
+data class DeviceIdentity @JvmOverloads constructor(
     val bluetoothName: String? = null,
     val address: String? = null,
     val serviceUuids: Set<String> = emptySet(),
     val manufacturerId: Int? = null,
+    val vendorId: Int? = null,
+    val productId: Int? = null,
 )
 
 data class EarbudsCapabilities(
