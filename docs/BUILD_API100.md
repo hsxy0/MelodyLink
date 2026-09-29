@@ -21,6 +21,8 @@ python scripts/verify_api100.py app/build/outputs/apk/debug/app-debug.apk
 
 Windows 使用 `gradlew.bat`。CI 为 `.github/workflows/android.yml`，推送构建相关变更会执行构建、单测和 APK 内容检查；在 Actions 的 Artifacts 下载 `MelodyLink-api100-debug-<run-id>`。
 
+2026-09-29：[首次 API 100 构建](https://github.com/hsxy0/MelodyLink/actions/runs/36550824182) 成功，验证代码提交为 `1a4cbb6`，75 项 JVM 单测全部通过。本机下载产物位于 `build/artifacts/36550824182/apk/app-debug.apk`。
+
 ## 仓库 SSH
 
 - 注册仓库：`hsxy0/MelodyLink`，Deploy Key 具有此仓库读写权限。
