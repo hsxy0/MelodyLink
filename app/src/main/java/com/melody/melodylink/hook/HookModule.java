@@ -75,9 +75,21 @@ import java.util.concurrent.TimeUnit;
 import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedInterface;
 
-/** Sony transport bridge and target-scoped diagnostics for Melody 16.8.3. */
-/** Installs behavior-changing hooks for the supported Sony device. */
+/**
+ * Installs target-scoped Melody hooks using API 100.
+ * @author WU
+ */
 public final class HookModule extends XposedModule {
+    /** Entry constructor required by the API 100 framework. */
+    public HookModule(XposedInterface base, ModuleLoadedParam param) {
+        super(base, param);
+    }
+
+    /** Preserve the existing tagged log calls using the API 100 four-argument method. */
+    private void log(int priority, String tag, String message) {
+        log(priority, tag, message, null);
+    }
+
     private static final String TAG = "MelodyLinkObserver";
     private static final String TARGET = "com.oplus.melody";
     private static final String ADVANCED_CATEGORY_KEY = "melodylink.advanced_settings";
@@ -417,7 +429,7 @@ public final class HookModule extends XposedModule {
     });
 
     @Override
-    public void onPackageReady(PackageReadyParam param) {
+    public void onPackageLoaded(PackageLoadedParam param) {
         if (!TARGET.equals(param.getPackageName())) return;
         try {
             initializeSonyConfig();
@@ -536,9 +548,7 @@ public final class HookModule extends XposedModule {
                 return;
             }
             Method method = selected;
-            hook(method)
-                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .intercept(chain -> {
+            Api100Interception.install(this, method, chain -> {
                 boolean melodyEarphoneLiveData = isMelodyEarphoneLiveData(chain.getThisObject());
                 boolean traceCall = shouldTrace(label, chain, arity);
                 if ("melodyEarphoneLiveDataRequest".equals(label)
@@ -804,7 +814,7 @@ public final class HookModule extends XposedModule {
     }
 
     @SuppressLint("MissingPermission")
-    private boolean shouldTrace(String label, XposedInterface.Chain chain, int arity) {
+    private boolean shouldTrace(String label, Api100Interception.Chain chain, int arity) {
         if ("whitelist".equals(label)) {
             return arity > 2 && chain.getArg(2) instanceof String
                     && isRegisteredSonyName((String) chain.getArg(2));
@@ -1057,7 +1067,7 @@ public final class HookModule extends XposedModule {
                 return false;
             }
             sharedStateStore = MelodySharedStateStore.from(application);
-            ApplicationInfo moduleInfo = getModuleApplicationInfo();
+            ApplicationInfo moduleInfo = getApplicationInfo();
             String moduleApkPath = moduleInfo.sourceDir;
             if (moduleApkPath == null || moduleApkPath.isEmpty()) {
                 log(Log.ERROR, TAG, event("Sony configuration unavailable: module APK path is empty"));
@@ -2569,7 +2579,7 @@ public final class HookModule extends XposedModule {
         return MelodySharedStateStore.readState(sharedStateFile());
     }
 
-    private void captureRepository(String label, XposedInterface.Chain chain) {
+    private void captureRepository(String label, Api100Interception.Chain chain) {
         if (!label.startsWith("repository") && !"noiseWrite".equals(label)) return;
         Object address = null;
         if (("repositoryGet".equals(label) || "repositoryObserve".equals(label)
@@ -2978,7 +2988,7 @@ public final class HookModule extends XposedModule {
         return MethodCallObserver.signature(method);
     }
 
-    private static String describeArgs(XposedInterface.Chain chain, int arity) {
+    private static String describeArgs(Api100Interception.Chain chain, int arity) {
         return MethodCallObserver.describeArgs(chain, arity);
     }
 

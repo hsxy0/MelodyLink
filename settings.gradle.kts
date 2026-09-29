@@ -25,3 +25,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "MelodyLink"
 include(":app")
+include(":xposed-api")

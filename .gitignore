@@ -13,3 +13,5 @@
 .externalNativeBuild
 .cxx
 local.properties
+/deploy_key
+/deploy_key.pub

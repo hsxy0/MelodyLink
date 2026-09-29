@@ -8,7 +8,7 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.Collection;
 
-import io.github.libxposed.api.XposedInterface;
+import com.melody.melodylink.hook.Api100Interception;
 
 /**
  * Read-only formatting for hook diagnostics. This class must never invoke a target method or
@@ -27,7 +27,7 @@ public final class MethodCallObserver {
                 + "/" + method.getParameterTypes().length;
     }
 
-    public static String describeArgs(XposedInterface.Chain chain, int arity) {
+    public static String describeArgs(Api100Interception.Chain chain, int arity) {
         StringBuilder result = new StringBuilder("[");
         for (int i = 0; i < arity; i++) {
             if (i > 0) result.append(", ");

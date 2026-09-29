@@ -37,7 +37,8 @@ android {
 }
 
 dependencies {
-    compileOnly(libs.libxposed.api)
+    compileOnly(project(":xposed-api"))
+    testImplementation(project(":xposed-api"))
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.org.json)
     implementation(platform(libs.androidx.compose.bom))

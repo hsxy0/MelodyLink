@@ -1,0 +1,64 @@
+name: Android API 100 CI
+
+on:
+  push:
+    branches: ['**']
+    paths:
+      - 'app/**'
+      - 'xposed-api/**'
+      - 'gradle/**'
+      - '*.gradle.kts'
+      - 'gradle.properties'
+      - 'scripts/**'
+      - '.github/workflows/android.yml'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v4
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools'
+          log-accepted-android-sdk-licenses: 'false'
+      - name: Install Android SDK
+        run: sdkmanager --channel=3 'platforms;android-37.0'
+      - name: Verify API 100 source contract
+        run: python3 scripts/verify_api100.py
+      - name: Build debug APK
+        run: bash gradlew --no-daemon --stacktrace :app:assembleDebug
+      - name: Run unit tests
+        run: bash gradlew --no-daemon --stacktrace :app:testDebugUnitTest
+      - name: Verify packaged API contract
+        run: python3 scripts/verify_api100.py app/build/outputs/apk/debug/app-debug.apk
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: MelodyLink-api100-debug-${{ github.run_id }}
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MelodyLink-test-reports-${{ github.run_id }}
+          path: |
+            app/build/reports/tests/
+            app/build/test-results/
